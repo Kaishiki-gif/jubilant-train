@@ -28,6 +28,11 @@ const WORDS_FILE = path.join(__dirname, 'words.json');
 const STATE_FILE = path.join(__dirname, 'state.json');
 const USERS_API_SECRET = process.env.USERS_API_SECRET;
 
+const RICHMENU_IMAGE_PATH = path.join(__dirname, 'richmenu.png');
+const RICHMENU_NAME = 'daily-word-menu';
+// リッチメニューのボタンをタップすると、このテキストがメッセージとして送られてくる
+const SEND_TRIGGER_TEXT = '今日の単語を送る';
+
 if (!config.channelAccessToken || !config.channelSecret) {
   console.warn('警告: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET が未設定です。.env を確認してください。');
 }
@@ -147,7 +152,7 @@ async function handleEvent(event) {
     }
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: '友だち追加ありがとうございます！\n毎朝9時に日本語の単語をお届けします。',
+      text: '友だち追加ありがとうございます！\n毎朝9時に日本語の単語をお届けします。\n下のメニューの「送信」ボタンからも、いつでもすぐに送信できます。',
     });
   }
 
@@ -157,8 +162,69 @@ async function handleEvent(event) {
     console.log(`友だち解除: ${userId}`);
   }
 
+  if (event.type === 'message' && event.message && event.message.type === 'text') {
+    const text = event.message.text.trim();
+    if (text === SEND_TRIGGER_TEXT) {
+      const result = await sendDailyWord();
+      let replyText;
+      if (result.ok) {
+        const successCount = result.results.filter((r) => r.ok).length;
+        replyText = `送信しました！(${successCount}/${result.results.length}人に届きました)`;
+      } else if (result.reason === 'no users') {
+        replyText = 'まだ友だち登録者がいないため、送信をスキップしました。';
+      } else {
+        replyText = '単語データが見つかりませんでした。words.json を確認してください。';
+      }
+      return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
+    }
+    // トリガー以外のメッセージは無視
+    return null;
+  }
+
   return null;
 }
+
+// --- リッチメニュー(チャット下部の呼び出しボタン)のセットアップ ---
+// 1回実行すれば、以後は全ユーザーのトーク画面下部にボタンが表示される。
+// 再実行しても同名の古いメニューを削除してから作り直すので、増殖しない。
+app.get('/setup-richmenu', async (req, res) => {
+  if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  try {
+    const existing = await client.getRichMenuList();
+    for (const menu of existing) {
+      if (menu.name === RICHMENU_NAME) {
+        await client.deleteRichMenu(menu.richMenuId);
+        console.log(`古いリッチメニューを削除: ${menu.richMenuId}`);
+      }
+    }
+
+    const richMenuId = await client.createRichMenu({
+      size: { width: 2500, height: 843 },
+      selected: true,
+      name: RICHMENU_NAME,
+      chatBarText: '今日の単語',
+      areas: [
+        {
+          bounds: { x: 0, y: 0, width: 2500, height: 843 },
+          action: { type: 'message', label: '送信', text: SEND_TRIGGER_TEXT },
+        },
+      ],
+    });
+
+    const imageBuffer = fs.readFileSync(RICHMENU_IMAGE_PATH);
+    await client.setRichMenuImage(richMenuId, imageBuffer, 'image/png');
+    await client.setDefaultRichMenu(richMenuId);
+
+    console.log(`リッチメニューを設定しました: ${richMenuId}`);
+    res.json({ ok: true, richMenuId });
+  } catch (err) {
+    const detail = (err && err.originalError && err.originalError.response && err.originalError.response.data) || err.message;
+    console.error('リッチメニュー設定エラー:', detail);
+    res.status(500).json({ ok: false, error: detail });
+  }
+});
 
 // --- 動作確認用エンドポイント(?token=USERS_API_SECRET で保護) ---
 app.get('/users', (req, res) => {
