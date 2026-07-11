@@ -133,7 +133,8 @@ function pickRandomThemeWord(excludeWord) {
 }
 
 function newSessionWithTheme(theme) {
-  return { theme, count: 0, list: [], startedAt: new Date().toISOString() };
+  // usedWords: このラウンドで既に使った単語(お題自身も含む)。同じ単語の使い回しを防ぐ。
+  return { theme, count: 0, list: [], usedWords: [theme.word], startedAt: new Date().toISOString() };
 }
 
 function formatThemeMessage(theme) {
@@ -292,14 +293,19 @@ async function handleEvent(event) {
         text: 'まずはリッチメニューの「お題を受け取る」から始めてください！',
       });
     }
+    // 古いセッション(usedWords導入前)との互換用
+    if (!Array.isArray(session.usedWords)) {
+      session.usedWords = [session.theme.word];
+    }
 
-    // お題と全く同じ単語は禁止(判定すら行わず即座に却下し、カウント・リストには一切影響しない)
-    if (text === session.theme.word) {
-      console.log(`同一単語のため却下 (${userId}): お題="${session.theme.word}"`);
+    // お題と同じ単語、またはこのラウンドで既に使った単語は禁止
+    // (判定すら行わず即座に却下し、カウント・リストには一切影響しない)
+    if (session.usedWords.includes(text)) {
+      console.log(`使用済み単語のため却下 (${userId}): "${text}" (既に使用: ${session.usedWords.join(', ')})`);
       return client.replyMessage(event.replyToken, {
         type: 'text',
         text:
-          `「${text}」はお題と同じ単語なので使えません。\n` +
+          `「${text}」は既に使った単語(またはお題と同じ単語)なので使えません。\n` +
           `別の単語を送ってください。\n(カウント: ${session.count}/${REQUIRED_COUNT})`,
       });
     }
@@ -318,6 +324,9 @@ async function handleEvent(event) {
     const userVowels = extractVowels(userReadingKatakana);
     const mark = judge(userVowels, session.theme.vowels);
     console.log(`判定 (${userId}): "${text}"(${userVowels}) vs お題"${session.theme.word}"(${session.theme.vowels}) => ${mark}`);
+
+    // 判定結果にかかわらず、送った単語は「使用済み」として記録する(次回以降の使い回しを防ぐ)
+    session.usedWords.push(text);
 
     if (mark === '○') {
       session.count += 1;
