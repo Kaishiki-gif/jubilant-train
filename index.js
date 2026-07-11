@@ -269,6 +269,7 @@ async function handleEvent(event) {
   if (event.type === 'message' && event.message && event.message.type === 'text') {
     const userId = event.source.userId;
     const text = event.message.text.trim();
+    console.log(`メッセージ受信 (${userId}): "${text}"`);
 
     if (text === THEME_TRIGGER_TEXT) {
       const sessions = loadSessions();
@@ -294,6 +295,7 @@ async function handleEvent(event) {
 
     // お題と全く同じ単語は禁止(判定すら行わず即座に却下し、カウント・リストには一切影響しない)
     if (text === session.theme.word) {
+      console.log(`同一単語のため却下 (${userId}): お題="${session.theme.word}"`);
       return client.replyMessage(event.replyToken, {
         type: 'text',
         text:
@@ -315,6 +317,7 @@ async function handleEvent(event) {
     const userReadingHiragana = userReadingKatakana.replace(/[ァ-ヶ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0x60));
     const userVowels = extractVowels(userReadingKatakana);
     const mark = judge(userVowels, session.theme.vowels);
+    console.log(`判定 (${userId}): "${text}"(${userVowels}) vs お題"${session.theme.word}"(${session.theme.vowels}) => ${mark}`);
 
     if (mark === '○') {
       session.count += 1;
