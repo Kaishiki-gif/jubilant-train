@@ -31,6 +31,7 @@ const USERS_FILE = path.join(__dirname, 'users.json');
 const THEME_WORDS_FILE = path.join(__dirname, 'theme-words.json');
 const DAILY_STATE_FILE = path.join(__dirname, 'daily-state.json');
 const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
+const RESULTS_LOG_FILE = path.join(__dirname, 'results-log.json');
 const USERS_API_SECRET = process.env.USERS_API_SECRET;
 
 const RICHMENU_IMAGE_PATH = path.join(__dirname, 'richmenu.png');
@@ -169,6 +170,26 @@ function formatResultMessage(session) {
   return lines.join('\n');
 }
 
+// ラウンド終了時に、結果リストを results-log.json に集約保存する(管理者が /results で閲覧できる)
+async function appendResultLog(userId, session) {
+  const log = loadJSON(RESULTS_LOG_FILE, []);
+  let displayName = userId;
+  try {
+    const profile = await client.getProfile(userId);
+    displayName = profile.displayName || userId;
+  } catch (e) {
+    // プロフィール取得に失敗しても記録は続ける(表示名の代わりにuserIdを使う)
+  }
+  log.push({
+    userId,
+    displayName,
+    theme: session.theme,
+    list: session.list,
+    completedAt: new Date().toISOString(),
+  });
+  saveJSON(RESULTS_LOG_FILE, log);
+}
+
 // --- 毎日 9:00 (Asia/Tokyo) に全ユーザーへお題を配信 ---
 async function sendDailyThemeToAll() {
   const theme = pickDailyThemeWord();
@@ -283,7 +304,9 @@ async function handleEvent(event) {
     }
     const userReadingHiragana = userReadingKatakana.replace(/[ァ-ヶ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0x60));
     const userVowels = extractVowels(userReadingKatakana);
-    const mark = judge(userVowels, session.theme.vowels);
+    // お題と全く同じ単語をそのまま返した場合は、韻の練習にならないので自動的に×(リストにも追加しない)
+    const isSameWord = text === session.theme.word;
+    const mark = isSameWord ? '×' : judge(userVowels, session.theme.vowels);
 
     if (mark === '○') {
       session.count += 1;
@@ -295,7 +318,13 @@ async function handleEvent(event) {
     let replyText;
     if (session.count >= REQUIRED_COUNT) {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark) + '\n\n' + formatResultMessage(session);
+      await appendResultLog(userId, session);
       delete sessions[userId]; // ラウンド終了、セッションをクリア
+    } else if (isSameWord) {
+      replyText =
+        formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark) +
+        '\n\n(お題と同じ単語なので不成立です。別の単語を送ってください)';
+      sessions[userId] = session;
     } else {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark);
       sessions[userId] = session;
@@ -362,6 +391,52 @@ app.post('/send-daily-theme', async (req, res) => {
   }
   const result = await sendDailyThemeToAll();
   res.json(result);
+});
+
+// みんなの「4つ達成」結果を一覧で見られるページ(スマホのブラウザでもOK)
+app.get('/results', (req, res) => {
+  if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const log = loadJSON(RESULTS_LOG_FILE, []);
+  const cards = [...log]
+    .reverse()
+    .map((entry) => {
+      const date = new Date(entry.completedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+      const items = entry.list
+        .map((item) => `<li>${item.mark} ${entry.theme.word} → ${item.userWord}</li>`)
+        .join('');
+      return `
+        <div class="card">
+          <div class="meta">${date} ・ ${entry.displayName}</div>
+          <div class="theme">お題: ${entry.theme.word}(${entry.theme.reading}) / 母音: ${entry.theme.vowels}</div>
+          <ul>${items}</ul>
+        </div>`;
+    })
+    .join('');
+
+  res.send(`<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>韻トレ結果一覧</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background:#f2f2f5; margin:0; padding:16px; color:#222; }
+  h1 { font-size:20px; margin-bottom:16px; }
+  .card { background:#fff; border-radius:12px; padding:14px 16px; margin-bottom:12px; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  .meta { font-size:12px; color:#888; margin-bottom:4px; }
+  .theme { font-weight:bold; margin-bottom:6px; }
+  ul { margin:0; padding-left:20px; }
+  li { margin:2px 0; }
+  .empty { color:#888; text-align:center; margin-top:40px; }
+</style>
+</head>
+<body>
+  <h1>韻トレ結果一覧(${log.length}件)</h1>
+  ${log.length === 0 ? '<div class="empty">まだ結果がありません</div>' : cards}
+</body>
+</html>`);
 });
 
 app.get('/', (req, res) => {
