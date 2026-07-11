@@ -21,18 +21,26 @@ const cron = require('node-cron');
 const kuromoji = require('kuromoji');
 const { middleware, Client } = require('@line/bot-sdk');
 const { extractVowels, judge } = require('./kana');
+const { loadData, saveData, hasUpstash } = require('./storage');
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
-const USERS_FILE = path.join(__dirname, 'users.json');
+// 永続データ(Upstash Redisのキー名 / フォールバック時はローカルファイル名)
+const USERS_KEY = 'users';
+const DAILY_STATE_KEY = 'daily-state';
+const SESSIONS_KEY = 'sessions';
+const RESULTS_LOG_KEY = 'results-log';
+
+// theme-words.json はコードと一緒にデプロイされる静的な参照データなので、ローカルファイルのままでよい
 const THEME_WORDS_FILE = path.join(__dirname, 'theme-words.json');
-const DAILY_STATE_FILE = path.join(__dirname, 'daily-state.json');
-const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
-const RESULTS_LOG_FILE = path.join(__dirname, 'results-log.json');
 const USERS_API_SECRET = process.env.USERS_API_SECRET;
+
+if (!hasUpstash) {
+  console.warn('警告: Upstash未設定のため、デプロイのたびに友だちリスト・結果が消える可能性があります。');
+}
 
 const RICHMENU_IMAGE_PATH = path.join(__dirname, 'richmenu.png');
 const RICHMENU_NAME = 'rhyme-theme-menu';
@@ -57,26 +65,23 @@ function loadJSON(file, fallback) {
     return fallback;
   }
 }
-function saveJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
 
-function loadUsers() {
-  return loadJSON(USERS_FILE, []);
+async function loadUsers() {
+  return loadData(USERS_KEY, []);
 }
-function saveUsers(users) {
-  saveJSON(USERS_FILE, users);
+async function saveUsers(users) {
+  return saveData(USERS_KEY, users);
 }
 
 function loadThemeWords() {
   return loadJSON(THEME_WORDS_FILE, []);
 }
 
-function loadSessions() {
-  return loadJSON(SESSIONS_FILE, {});
+async function loadSessions() {
+  return loadData(SESSIONS_KEY, {});
 }
-function saveSessions(sessions) {
-  saveJSON(SESSIONS_FILE, sessions);
+async function saveSessions(sessions) {
+  return saveData(SESSIONS_KEY, sessions);
 }
 
 function shuffle(arr) {
@@ -109,17 +114,17 @@ async function getReadingKatakana(text) {
 
 // --- お題(テーマ単語)のローテーション ---
 // 「今日の一問」用: 全ユーザー共通で、使い切るまで重複しないようにシャッフルしながら選ぶ
-function pickDailyThemeWord() {
+async function pickDailyThemeWord() {
   const words = loadThemeWords();
   if (words.length === 0) return null;
 
-  let state = loadJSON(DAILY_STATE_FILE, null);
+  let state = await loadData(DAILY_STATE_KEY, null);
   if (!state || !Array.isArray(state.order) || state.pointer >= state.order.length) {
     state = { order: shuffle(words.map((_, i) => i)), pointer: 0 };
   }
   const idx = state.order[state.pointer];
   state.pointer += 1;
-  saveJSON(DAILY_STATE_FILE, state);
+  await saveData(DAILY_STATE_KEY, state);
   return words[idx];
 }
 
@@ -171,9 +176,9 @@ function formatResultMessage(session) {
   return lines.join('\n');
 }
 
-// ラウンド終了時に、結果リストを results-log.json に集約保存する(管理者が /results で閲覧できる)
+// ラウンド終了時に、結果リストを results-log に集約保存する(管理者が /results で閲覧できる)
 async function appendResultLog(userId, session) {
-  const log = loadJSON(RESULTS_LOG_FILE, []);
+  const log = await loadData(RESULTS_LOG_KEY, []);
   let displayName = userId;
   try {
     const profile = await client.getProfile(userId);
@@ -188,23 +193,23 @@ async function appendResultLog(userId, session) {
     list: session.list,
     completedAt: new Date().toISOString(),
   });
-  saveJSON(RESULTS_LOG_FILE, log);
+  await saveData(RESULTS_LOG_KEY, log);
 }
 
 // --- 毎日 9:00 (Asia/Tokyo) に全ユーザーへお題を配信 ---
 async function sendDailyThemeToAll() {
-  const theme = pickDailyThemeWord();
+  const theme = await pickDailyThemeWord();
   if (!theme) {
     console.error('theme-words.json が空です。');
     return { ok: false, reason: 'no theme words' };
   }
-  const users = loadUsers();
+  const users = await loadUsers();
   if (users.length === 0) {
     console.log('登録ユーザーがいません。送信をスキップしました。');
     return { ok: false, reason: 'no users' };
   }
 
-  const sessions = loadSessions();
+  const sessions = await loadSessions();
   const results = [];
   for (const userId of users) {
     sessions[userId] = newSessionWithTheme(theme);
@@ -217,7 +222,7 @@ async function sendDailyThemeToAll() {
       console.error(`送信失敗 (${userId}):`, detail);
     }
   }
-  saveSessions(sessions);
+  await saveSessions(sessions);
   return { ok: true, theme, results };
 }
 
@@ -245,10 +250,10 @@ app.post('/webhook', middleware(config), async (req, res) => {
 async function handleEvent(event) {
   if (event.type === 'follow') {
     const userId = event.source.userId;
-    const users = loadUsers();
+    const users = await loadUsers();
     if (!users.includes(userId)) {
       users.push(userId);
-      saveUsers(users);
+      await saveUsers(users);
       console.log(`新しい友だち登録: ${userId}`);
     }
     return client.replyMessage(event.replyToken, {
@@ -262,7 +267,8 @@ async function handleEvent(event) {
 
   if (event.type === 'unfollow') {
     const userId = event.source.userId;
-    saveUsers(loadUsers().filter((id) => id !== userId));
+    const users = await loadUsers();
+    await saveUsers(users.filter((id) => id !== userId));
     console.log(`友だち解除: ${userId}`);
     return null;
   }
@@ -273,19 +279,19 @@ async function handleEvent(event) {
     console.log(`メッセージ受信 (${userId}): "${text}"`);
 
     if (text === THEME_TRIGGER_TEXT) {
-      const sessions = loadSessions();
+      const sessions = await loadSessions();
       const prevWord = sessions[userId] && sessions[userId].theme ? sessions[userId].theme.word : null;
       const theme = pickRandomThemeWord(prevWord);
       if (!theme) {
         return client.replyMessage(event.replyToken, { type: 'text', text: 'お題データが見つかりませんでした。' });
       }
       sessions[userId] = newSessionWithTheme(theme);
-      saveSessions(sessions);
+      await saveSessions(sessions);
       return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
     }
 
     // トリガー以外のテキストは「単語での回答」として判定する
-    const sessions = loadSessions();
+    const sessions = await loadSessions();
     const session = sessions[userId];
     if (!session || !session.theme) {
       return client.replyMessage(event.replyToken, {
@@ -344,7 +350,7 @@ async function handleEvent(event) {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark);
       sessions[userId] = session;
     }
-    saveSessions(sessions);
+    await saveSessions(sessions);
 
     return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
   }
@@ -393,11 +399,11 @@ app.get('/setup-richmenu', async (req, res) => {
 });
 
 // --- 動作確認用エンドポイント(?token=USERS_API_SECRET で保護) ---
-app.get('/users', (req, res) => {
+app.get('/users', async (req, res) => {
   if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
     return res.status(403).json({ error: 'forbidden' });
   }
-  res.json({ users: loadUsers() });
+  res.json({ users: await loadUsers() });
 });
 
 app.post('/send-daily-theme', async (req, res) => {
@@ -409,11 +415,11 @@ app.post('/send-daily-theme', async (req, res) => {
 });
 
 // みんなの「4つ達成」結果を一覧で見られるページ(スマホのブラウザでもOK)
-app.get('/results', (req, res) => {
+app.get('/results', async (req, res) => {
   if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
     return res.status(403).send('forbidden');
   }
-  const log = loadJSON(RESULTS_LOG_FILE, []);
+  const log = await loadData(RESULTS_LOG_KEY, []);
   const cards = [...log]
     .reverse()
     .map((entry) => {
