@@ -1,22 +1,26 @@
-// LINE 日本語単語Bot サーバー
+// LINE 韻トレーニングBot(ラップの韻の練習用)サーバー
 //
 // 役割:
-//   1. 友だち追加(follow)イベントを受け取り、userId を users.json に保存
-//   2. 友だち解除(unfollow)イベントを受け取り、users.json から削除
-//   3. 毎日 9:00 (Asia/Tokyo) に、words.json から単語を1つ選び、
-//      登録済み全ユーザーに個別 push メッセージを送信(node-cronで自前実行)
-//   4. GET /users, POST /test-send は動作確認用(トークンで保護)
+//   1. 友だち追加(follow)/解除(unfollow)を検知して users.json を更新
+//   2. 毎日 9:00 (Asia/Tokyo) に「お題」の単語を全ユーザーに送信(node-cronで自前実行)
+//   3. リッチメニューの「お題を受け取る」ボタン(= トリガーメッセージ)で、いつでも自分だけ新しいお題を受け取れる
+//   4. ユーザーが単語を送るたびに、お題の単語と韻を踏んでいるか(母音の一致)を判定して返信
+//      ○: 母音が完全一致 → カウント+1、リストに追加
+//      △: お題の母音の後半部分と一致 → カウントなし、リストに追加
+//      ×: 不一致 → カウントなし、リストにも追加しない
+//      ○が4つ貯まったら結果リストを表示してそのラウンドは終了
 //
-// 注意: LINE の仕様上、ユーザーが公式アカウントを友だち追加すると
-// 自動的に Bot とその人だけの 1:1 トークルームが作られるため、
-// ルーム作成のための特別な実装は不要。
+// 単語の読み(ひらがな/カタカナ)には kuromoji による形態素解析を使用しているため、
+// 未知語・固有名詞などは読みが不正確になる場合があります。
 
 require('dotenv').config();
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const cron = require('node-cron');
+const kuromoji = require('kuromoji');
 const { middleware, Client } = require('@line/bot-sdk');
+const { extractVowels, judge } = require('./kana');
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -24,20 +28,22 @@ const config = {
 };
 
 const USERS_FILE = path.join(__dirname, 'users.json');
-const WORDS_FILE = path.join(__dirname, 'words.json');
-const STATE_FILE = path.join(__dirname, 'state.json');
+const THEME_WORDS_FILE = path.join(__dirname, 'theme-words.json');
+const DAILY_STATE_FILE = path.join(__dirname, 'daily-state.json');
+const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
 const USERS_API_SECRET = process.env.USERS_API_SECRET;
 
 const RICHMENU_IMAGE_PATH = path.join(__dirname, 'richmenu.png');
-const RICHMENU_NAME = 'daily-word-menu';
+const RICHMENU_NAME = 'rhyme-theme-menu';
 // リッチメニューのボタンをタップすると、このテキストがメッセージとして送られてくる
-const SEND_TRIGGER_TEXT = '今日の単語を送る';
+const THEME_TRIGGER_TEXT = '今日のお題を受け取る';
+const REQUIRED_COUNT = 4;
 
 if (!config.channelAccessToken || !config.channelSecret) {
   console.warn('警告: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET が未設定です。.env を確認してください。');
 }
 if (!USERS_API_SECRET) {
-  console.warn('警告: USERS_API_SECRET が未設定です。/users, /test-send が保護されません。');
+  console.warn('警告: USERS_API_SECRET が未設定です。管理用エンドポイントが保護されません。');
 }
 
 const client = new Client(config);
@@ -61,6 +67,17 @@ function saveUsers(users) {
   saveJSON(USERS_FILE, users);
 }
 
+function loadThemeWords() {
+  return loadJSON(THEME_WORDS_FILE, []);
+}
+
+function loadSessions() {
+  return loadJSON(SESSIONS_FILE, {});
+}
+function saveSessions(sessions) {
+  saveJSON(SESSIONS_FILE, sessions);
+}
+
 function shuffle(arr) {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -70,61 +87,123 @@ function shuffle(arr) {
   return a;
 }
 
-// words.json を順番が偏らないようにシャッフルしながら1つずつ選ぶ
-// (全部使い切ったら再シャッフルして繰り返す = 連続で同じ単語が出にくい)
-function pickNextWord() {
-  const words = loadJSON(WORDS_FILE, []);
+// --- kuromoji: 単語の読み(カタカナ)を取得 ---
+const tokenizerPromise = new Promise((resolve, reject) => {
+  kuromoji.builder({ dicPath: path.join(__dirname, 'node_modules/kuromoji/dict') }).build((err, tokenizer) => {
+    if (err) {
+      console.error('kuromoji の初期化に失敗しました:', err);
+      reject(err);
+    } else {
+      console.log('kuromoji の初期化が完了しました');
+      resolve(tokenizer);
+    }
+  });
+});
+
+async function getReadingKatakana(text) {
+  const tokenizer = await tokenizerPromise;
+  const tokens = tokenizer.tokenize(text);
+  return tokens.map((t) => t.reading || t.surface_form).join('');
+}
+
+// --- お題(テーマ単語)のローテーション ---
+// 「今日の一問」用: 全ユーザー共通で、使い切るまで重複しないようにシャッフルしながら選ぶ
+function pickDailyThemeWord() {
+  const words = loadThemeWords();
   if (words.length === 0) return null;
 
-  let state = loadJSON(STATE_FILE, null);
+  let state = loadJSON(DAILY_STATE_FILE, null);
   if (!state || !Array.isArray(state.order) || state.pointer >= state.order.length) {
     state = { order: shuffle(words.map((_, i) => i)), pointer: 0 };
   }
   const idx = state.order[state.pointer];
   state.pointer += 1;
-  saveJSON(STATE_FILE, state);
+  saveJSON(DAILY_STATE_FILE, state);
   return words[idx];
 }
 
-function formatMessage(word) {
-  return `【今日の単語】\n${word.word}(${word.reading})\n\n意味: ${word.meaning}\n\n例文: ${word.example}`;
+// 「いつでもボタン」用: ランダムに1つ選ぶ(直前と同じ単語は避ける)
+function pickRandomThemeWord(excludeWord) {
+  const words = loadThemeWords();
+  if (words.length === 0) return null;
+  const candidates = words.filter((w) => w.word !== excludeWord);
+  const pool = candidates.length > 0 ? candidates : words;
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
-async function sendDailyWord() {
-  const word = pickNextWord();
-  if (!word) {
-    console.error('words.json が空です。単語データを確認してください。');
-    return { ok: false, reason: 'no words' };
-  }
+function newSessionWithTheme(theme) {
+  return { theme, count: 0, list: [], startedAt: new Date().toISOString() };
+}
 
+function formatThemeMessage(theme) {
+  return (
+    `【今日のお題】\n${theme.word}(${theme.reading}) / 母音: ${theme.vowels}\n\n` +
+    `この単語と韻を踏む単語を、${REQUIRED_COUNT}つ送ってください！\n` +
+    `(母音が完全に一致で○、後半だけ一致で△です)`
+  );
+}
+
+function formatJudgmentMessage(session, userWord, userReadingHiragana, userVowels, mark) {
+  const theme = session.theme;
+  const markLabel = mark === '○' ? '○ 韻が成立しました！' : mark === '△' ? '△ 惜しい、後半だけ韻が一致しました' : '× 韻が成立しませんでした';
+  const lines = [
+    markLabel,
+    '',
+    `あなたの単語: ${userWord}(${userReadingHiragana}) 母音: ${userVowels || 'なし'}`,
+    `お題: ${theme.word}(${theme.reading}) 母音: ${theme.vowels}`,
+    '',
+    `カウント: ${session.count}/${REQUIRED_COUNT}`,
+  ];
+  if (session.count < REQUIRED_COUNT) {
+    lines.push('次の単語をどうぞ！');
+  }
+  return lines.join('\n');
+}
+
+function formatResultMessage(session) {
+  const lines = [`🎉 ${REQUIRED_COUNT}つ達成！お疲れさまでした`, '', '【結果リスト】'];
+  session.list.forEach((entry, i) => {
+    lines.push(`${i + 1}. ${entry.mark} ${session.theme.word} → ${entry.userWord}`);
+  });
+  lines.push('', 'リッチメニューの「お題を受け取る」から、またいつでも挑戦できます！');
+  return lines.join('\n');
+}
+
+// --- 毎日 9:00 (Asia/Tokyo) に全ユーザーへお題を配信 ---
+async function sendDailyThemeToAll() {
+  const theme = pickDailyThemeWord();
+  if (!theme) {
+    console.error('theme-words.json が空です。');
+    return { ok: false, reason: 'no theme words' };
+  }
   const users = loadUsers();
   if (users.length === 0) {
     console.log('登録ユーザーがいません。送信をスキップしました。');
     return { ok: false, reason: 'no users' };
   }
 
-  const text = formatMessage(word);
+  const sessions = loadSessions();
   const results = [];
   for (const userId of users) {
+    sessions[userId] = newSessionWithTheme(theme);
     try {
-      await client.pushMessage(userId, { type: 'text', text });
+      await client.pushMessage(userId, { type: 'text', text: formatThemeMessage(theme) });
       results.push({ userId, ok: true });
-      console.log(`送信成功: ${userId}`);
     } catch (err) {
       const detail = (err && err.originalError && err.originalError.response && err.originalError.response.data) || err.message;
       results.push({ userId, ok: false, error: detail });
       console.error(`送信失敗 (${userId}):`, detail);
     }
   }
-  return { ok: true, word, results };
+  saveSessions(sessions);
+  return { ok: true, theme, results };
 }
 
-// 毎日 9:00 (Asia/Tokyo) に自動実行
 cron.schedule(
   '0 9 * * *',
   () => {
-    console.log('毎日9時の一斉送信を開始します');
-    sendDailyWord();
+    console.log('毎日9時のお題配信を開始します');
+    sendDailyThemeToAll();
   },
   { timezone: 'Asia/Tokyo' }
 );
@@ -152,7 +231,10 @@ async function handleEvent(event) {
     }
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: '友だち追加ありがとうございます！\n毎朝9時に日本語の単語をお届けします。\n下のメニューの「送信」ボタンからも、いつでもすぐに送信できます。',
+      text:
+        '友だち追加ありがとうございます！\n' +
+        'これはラップの韻トレーニングBotです。\n' +
+        '毎朝9時にお題の単語をお届けします。下のメニューの「お題を受け取る」からも、いつでもすぐに挑戦できます。',
     });
   }
 
@@ -160,33 +242,73 @@ async function handleEvent(event) {
     const userId = event.source.userId;
     saveUsers(loadUsers().filter((id) => id !== userId));
     console.log(`友だち解除: ${userId}`);
+    return null;
   }
 
   if (event.type === 'message' && event.message && event.message.type === 'text') {
+    const userId = event.source.userId;
     const text = event.message.text.trim();
-    if (text === SEND_TRIGGER_TEXT) {
-      const result = await sendDailyWord();
-      let replyText;
-      if (result.ok) {
-        const successCount = result.results.filter((r) => r.ok).length;
-        replyText = `送信しました！(${successCount}/${result.results.length}人に届きました)`;
-      } else if (result.reason === 'no users') {
-        replyText = 'まだ友だち登録者がいないため、送信をスキップしました。';
-      } else {
-        replyText = '単語データが見つかりませんでした。words.json を確認してください。';
+
+    if (text === THEME_TRIGGER_TEXT) {
+      const sessions = loadSessions();
+      const prevWord = sessions[userId] && sessions[userId].theme ? sessions[userId].theme.word : null;
+      const theme = pickRandomThemeWord(prevWord);
+      if (!theme) {
+        return client.replyMessage(event.replyToken, { type: 'text', text: 'お題データが見つかりませんでした。' });
       }
-      return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
+      sessions[userId] = newSessionWithTheme(theme);
+      saveSessions(sessions);
+      return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
     }
-    // トリガー以外のメッセージは無視
-    return null;
+
+    // トリガー以外のテキストは「単語での回答」として判定する
+    const sessions = loadSessions();
+    const session = sessions[userId];
+    if (!session || !session.theme) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'まずはリッチメニューの「お題を受け取る」から始めてください！',
+      });
+    }
+
+    let userReadingKatakana;
+    try {
+      userReadingKatakana = await getReadingKatakana(text);
+    } catch (err) {
+      console.error('読み推定エラー:', err);
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: '単語の読みをうまく判定できませんでした。ひらがなで送ってみてください。',
+      });
+    }
+    const userReadingHiragana = userReadingKatakana.replace(/[ァ-ヶ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0x60));
+    const userVowels = extractVowels(userReadingKatakana);
+    const mark = judge(userVowels, session.theme.vowels);
+
+    if (mark === '○') {
+      session.count += 1;
+      session.list.push({ mark, userWord: text, userReading: userReadingHiragana });
+    } else if (mark === '△') {
+      session.list.push({ mark, userWord: text, userReading: userReadingHiragana });
+    }
+
+    let replyText;
+    if (session.count >= REQUIRED_COUNT) {
+      replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark) + '\n\n' + formatResultMessage(session);
+      delete sessions[userId]; // ラウンド終了、セッションをクリア
+    } else {
+      replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark);
+      sessions[userId] = session;
+    }
+    saveSessions(sessions);
+
+    return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
   }
 
   return null;
 }
 
 // --- リッチメニュー(チャット下部の呼び出しボタン)のセットアップ ---
-// 1回実行すれば、以後は全ユーザーのトーク画面下部にボタンが表示される。
-// 再実行しても同名の古いメニューを削除してから作り直すので、増殖しない。
 app.get('/setup-richmenu', async (req, res) => {
   if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
     return res.status(403).json({ error: 'forbidden' });
@@ -194,7 +316,7 @@ app.get('/setup-richmenu', async (req, res) => {
   try {
     const existing = await client.getRichMenuList();
     for (const menu of existing) {
-      if (menu.name === RICHMENU_NAME) {
+      if (menu.name === RICHMENU_NAME || menu.name === 'daily-word-menu') {
         await client.deleteRichMenu(menu.richMenuId);
         console.log(`古いリッチメニューを削除: ${menu.richMenuId}`);
       }
@@ -204,11 +326,11 @@ app.get('/setup-richmenu', async (req, res) => {
       size: { width: 2500, height: 843 },
       selected: true,
       name: RICHMENU_NAME,
-      chatBarText: '今日の単語',
+      chatBarText: 'お題を受け取る',
       areas: [
         {
           bounds: { x: 0, y: 0, width: 2500, height: 843 },
-          action: { type: 'message', label: '送信', text: SEND_TRIGGER_TEXT },
+          action: { type: 'message', label: 'お題を受け取る', text: THEME_TRIGGER_TEXT },
         },
       ],
     });
@@ -234,16 +356,16 @@ app.get('/users', (req, res) => {
   res.json({ users: loadUsers() });
 });
 
-app.post('/test-send', async (req, res) => {
+app.post('/send-daily-theme', async (req, res) => {
   if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
     return res.status(403).json({ error: 'forbidden' });
   }
-  const result = await sendDailyWord();
+  const result = await sendDailyThemeToAll();
   res.json(result);
 });
 
 app.get('/', (req, res) => {
-  res.send('LINE 日本語単語Bot サーバーは稼働中です。');
+  res.send('LINE 韻トレーニングBot サーバーは稼働中です。');
 });
 
 const PORT = process.env.PORT || 3000;

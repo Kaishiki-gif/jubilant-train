@@ -1,0 +1,536 @@
+[
+  {
+    "word": "愛",
+    "reading": "あい",
+    "mora": 2,
+    "vowels": "ai"
+  },
+  {
+    "word": "恋",
+    "reading": "こい",
+    "mora": 2,
+    "vowels": "oi"
+  },
+  {
+    "word": "花",
+    "reading": "はな",
+    "mora": 2,
+    "vowels": "aa"
+  },
+  {
+    "word": "空",
+    "reading": "そら",
+    "mora": 2,
+    "vowels": "oa"
+  },
+  {
+    "word": "月",
+    "reading": "つき",
+    "mora": 2,
+    "vowels": "ui"
+  },
+  {
+    "word": "海",
+    "reading": "うみ",
+    "mora": 2,
+    "vowels": "ui"
+  },
+  {
+    "word": "山",
+    "reading": "やま",
+    "mora": 2,
+    "vowels": "aa"
+  },
+  {
+    "word": "川",
+    "reading": "かわ",
+    "mora": 2,
+    "vowels": "aa"
+  },
+  {
+    "word": "雨",
+    "reading": "あめ",
+    "mora": 2,
+    "vowels": "ae"
+  },
+  {
+    "word": "雪",
+    "reading": "ゆき",
+    "mora": 2,
+    "vowels": "ui"
+  },
+  {
+    "word": "星",
+    "reading": "ほし",
+    "mora": 2,
+    "vowels": "oi"
+  },
+  {
+    "word": "風",
+    "reading": "かぜ",
+    "mora": 2,
+    "vowels": "ae"
+  },
+  {
+    "word": "夢",
+    "reading": "ゆめ",
+    "mora": 2,
+    "vowels": "ue"
+  },
+  {
+    "word": "涙",
+    "reading": "なみだ",
+    "mora": 3,
+    "vowels": "aia"
+  },
+  {
+    "word": "笑顔",
+    "reading": "えがお",
+    "mora": 3,
+    "vowels": "eao"
+  },
+  {
+    "word": "心",
+    "reading": "こころ",
+    "mora": 3,
+    "vowels": "ooo"
+  },
+  {
+    "word": "未来",
+    "reading": "みらい",
+    "mora": 3,
+    "vowels": "iai"
+  },
+  {
+    "word": "太陽",
+    "reading": "たいよう",
+    "mora": 4,
+    "vowels": "aiou"
+  },
+  {
+    "word": "世界",
+    "reading": "せかい",
+    "mora": 3,
+    "vowels": "eai"
+  },
+  {
+    "word": "音楽",
+    "reading": "おんがく",
+    "mora": 4,
+    "vowels": "oau"
+  },
+  {
+    "word": "言葉",
+    "reading": "ことば",
+    "mora": 3,
+    "vowels": "ooa"
+  },
+  {
+    "word": "時間",
+    "reading": "じかん",
+    "mora": 3,
+    "vowels": "ia"
+  },
+  {
+    "word": "人生",
+    "reading": "じんせい",
+    "mora": 4,
+    "vowels": "iei"
+  },
+  {
+    "word": "自由",
+    "reading": "じゆう",
+    "mora": 3,
+    "vowels": "iuu"
+  },
+  {
+    "word": "希望",
+    "reading": "きぼう",
+    "mora": 3,
+    "vowels": "iou"
+  },
+  {
+    "word": "現実",
+    "reading": "げんじつ",
+    "mora": 4,
+    "vowels": "eiu"
+  },
+  {
+    "word": "記憶",
+    "reading": "きおく",
+    "mora": 3,
+    "vowels": "iou"
+  },
+  {
+    "word": "情熱",
+    "reading": "じょうねつ",
+    "mora": 4,
+    "vowels": "iueu"
+  },
+  {
+    "word": "覚悟",
+    "reading": "かくご",
+    "mora": 3,
+    "vowels": "auo"
+  },
+  {
+    "word": "挑戦",
+    "reading": "ちょうせん",
+    "mora": 4,
+    "vowels": "iue"
+  },
+  {
+    "word": "勇気",
+    "reading": "ゆうき",
+    "mora": 3,
+    "vowels": "uui"
+  },
+  {
+    "word": "仲間",
+    "reading": "なかま",
+    "mora": 3,
+    "vowels": "aaa"
+  },
+  {
+    "word": "家族",
+    "reading": "かぞく",
+    "mora": 3,
+    "vowels": "aou"
+  },
+  {
+    "word": "友達",
+    "reading": "ともだち",
+    "mora": 4,
+    "vowels": "ooai"
+  },
+  {
+    "word": "青春",
+    "reading": "せいしゅん",
+    "mora": 4,
+    "vowels": "eii"
+  },
+  {
+    "word": "物語",
+    "reading": "ものがたり",
+    "mora": 5,
+    "vowels": "ooaai"
+  },
+  {
+    "word": "奇跡",
+    "reading": "きせき",
+    "mora": 3,
+    "vowels": "iei"
+  },
+  {
+    "word": "運命",
+    "reading": "うんめい",
+    "mora": 4,
+    "vowels": "uei"
+  },
+  {
+    "word": "宇宙",
+    "reading": "うちゅう",
+    "mora": 3,
+    "vowels": "uiu"
+  },
+  {
+    "word": "光",
+    "reading": "ひかり",
+    "mora": 3,
+    "vowels": "iai"
+  },
+  {
+    "word": "闇",
+    "reading": "やみ",
+    "mora": 2,
+    "vowels": "ai"
+  },
+  {
+    "word": "炎",
+    "reading": "ほのお",
+    "mora": 3,
+    "vowels": "ooo"
+  },
+  {
+    "word": "氷",
+    "reading": "こおり",
+    "mora": 3,
+    "vowels": "ooi"
+  },
+  {
+    "word": "波",
+    "reading": "なみ",
+    "mora": 2,
+    "vowels": "ai"
+  },
+  {
+    "word": "道",
+    "reading": "みち",
+    "mora": 2,
+    "vowels": "ii"
+  },
+  {
+    "word": "橋",
+    "reading": "はし",
+    "mora": 2,
+    "vowels": "ai"
+  },
+  {
+    "word": "街",
+    "reading": "まち",
+    "mora": 2,
+    "vowels": "ai"
+  },
+  {
+    "word": "夜",
+    "reading": "よる",
+    "mora": 2,
+    "vowels": "ou"
+  },
+  {
+    "word": "朝",
+    "reading": "あさ",
+    "mora": 2,
+    "vowels": "aa"
+  },
+  {
+    "word": "桜",
+    "reading": "さくら",
+    "mora": 3,
+    "vowels": "aua"
+  },
+  {
+    "word": "紅葉",
+    "reading": "もみじ",
+    "mora": 3,
+    "vowels": "oii"
+  },
+  {
+    "word": "鳥",
+    "reading": "とり",
+    "mora": 2,
+    "vowels": "oi"
+  },
+  {
+    "word": "魚",
+    "reading": "さかな",
+    "mora": 3,
+    "vowels": "aaa"
+  },
+  {
+    "word": "蝶",
+    "reading": "ちょう",
+    "mora": 2,
+    "vowels": "iu"
+  },
+  {
+    "word": "声",
+    "reading": "こえ",
+    "mora": 2,
+    "vowels": "oe"
+  },
+  {
+    "word": "歌",
+    "reading": "うた",
+    "mora": 2,
+    "vowels": "ua"
+  },
+  {
+    "word": "拳",
+    "reading": "こぶし",
+    "mora": 3,
+    "vowels": "oui"
+  },
+  {
+    "word": "汗",
+    "reading": "あせ",
+    "mora": 2,
+    "vowels": "ae"
+  },
+  {
+    "word": "骨",
+    "reading": "ほね",
+    "mora": 2,
+    "vowels": "oe"
+  },
+  {
+    "word": "傷",
+    "reading": "きず",
+    "mora": 2,
+    "vowels": "iu"
+  },
+  {
+    "word": "影",
+    "reading": "かげ",
+    "mora": 2,
+    "vowels": "ae"
+  },
+  {
+    "word": "鏡",
+    "reading": "かがみ",
+    "mora": 3,
+    "vowels": "aai"
+  },
+  {
+    "word": "窓",
+    "reading": "まど",
+    "mora": 2,
+    "vowels": "ao"
+  },
+  {
+    "word": "扉",
+    "reading": "とびら",
+    "mora": 3,
+    "vowels": "oia"
+  },
+  {
+    "word": "鍵",
+    "reading": "かぎ",
+    "mora": 2,
+    "vowels": "ai"
+  },
+  {
+    "word": "旅",
+    "reading": "たび",
+    "mora": 2,
+    "vowels": "ai"
+  },
+  {
+    "word": "地図",
+    "reading": "ちず",
+    "mora": 2,
+    "vowels": "iu"
+  },
+  {
+    "word": "時計",
+    "reading": "とけい",
+    "mora": 3,
+    "vowels": "oei"
+  },
+  {
+    "word": "電話",
+    "reading": "でんわ",
+    "mora": 3,
+    "vowels": "ea"
+  },
+  {
+    "word": "手紙",
+    "reading": "てがみ",
+    "mora": 3,
+    "vowels": "eai"
+  },
+  {
+    "word": "約束",
+    "reading": "やくそく",
+    "mora": 4,
+    "vowels": "auou"
+  },
+  {
+    "word": "秘密",
+    "reading": "ひみつ",
+    "mora": 3,
+    "vowels": "iiu"
+  },
+  {
+    "word": "真実",
+    "reading": "しんじつ",
+    "mora": 4,
+    "vowels": "iiu"
+  },
+  {
+    "word": "嘘",
+    "reading": "うそ",
+    "mora": 2,
+    "vowels": "uo"
+  },
+  {
+    "word": "孤独",
+    "reading": "こどく",
+    "mora": 3,
+    "vowels": "oou"
+  },
+  {
+    "word": "平和",
+    "reading": "へいわ",
+    "mora": 3,
+    "vowels": "eia"
+  },
+  {
+    "word": "戦争",
+    "reading": "せんそう",
+    "mora": 4,
+    "vowels": "eou"
+  },
+  {
+    "word": "正義",
+    "reading": "せいぎ",
+    "mora": 3,
+    "vowels": "eii"
+  },
+  {
+    "word": "悪魔",
+    "reading": "あくま",
+    "mora": 3,
+    "vowels": "aua"
+  },
+  {
+    "word": "天使",
+    "reading": "てんし",
+    "mora": 3,
+    "vowels": "ei"
+  },
+  {
+    "word": "神様",
+    "reading": "かみさま",
+    "mora": 4,
+    "vowels": "aiaa"
+  },
+  {
+    "word": "太鼓",
+    "reading": "たいこ",
+    "mora": 3,
+    "vowels": "aio"
+  },
+  {
+    "word": "財布",
+    "reading": "さいふ",
+    "mora": 3,
+    "vowels": "aiu"
+  },
+  {
+    "word": "眼鏡",
+    "reading": "めがね",
+    "mora": 3,
+    "vowels": "eae"
+  },
+  {
+    "word": "夜空",
+    "reading": "よぞら",
+    "mora": 3,
+    "vowels": "ooa"
+  },
+  {
+    "word": "港",
+    "reading": "みなと",
+    "mora": 3,
+    "vowels": "iao"
+  },
+  {
+    "word": "線路",
+    "reading": "せんろ",
+    "mora": 3,
+    "vowels": "eo"
+  },
+  {
+    "word": "駅",
+    "reading": "えき",
+    "mora": 2,
+    "vowels": "ei"
+  },
+  {
+    "word": "教室",
+    "reading": "きょうしつ",
+    "mora": 4,
+    "vowels": "iuiu"
+  }
+]
