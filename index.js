@@ -292,6 +292,16 @@ async function handleEvent(event) {
       });
     }
 
+    // お題と全く同じ単語は禁止(判定すら行わず即座に却下し、カウント・リストには一切影響しない)
+    if (text === session.theme.word) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text:
+          `「${text}」はお題と同じ単語なので使えません。\n` +
+          `別の単語を送ってください。\n(カウント: ${session.count}/${REQUIRED_COUNT})`,
+      });
+    }
+
     let userReadingKatakana;
     try {
       userReadingKatakana = await getReadingKatakana(text);
@@ -304,9 +314,7 @@ async function handleEvent(event) {
     }
     const userReadingHiragana = userReadingKatakana.replace(/[ァ-ヶ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0x60));
     const userVowels = extractVowels(userReadingKatakana);
-    // お題と全く同じ単語をそのまま返した場合は、韻の練習にならないので自動的に×(リストにも追加しない)
-    const isSameWord = text === session.theme.word;
-    const mark = isSameWord ? '×' : judge(userVowels, session.theme.vowels);
+    const mark = judge(userVowels, session.theme.vowels);
 
     if (mark === '○') {
       session.count += 1;
@@ -320,11 +328,6 @@ async function handleEvent(event) {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark) + '\n\n' + formatResultMessage(session);
       await appendResultLog(userId, session);
       delete sessions[userId]; // ラウンド終了、セッションをクリア
-    } else if (isSameWord) {
-      replyText =
-        formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark) +
-        '\n\n(お題と同じ単語なので不成立です。別の単語を送ってください)';
-      sessions[userId] = session;
     } else {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark);
       sessions[userId] = session;
