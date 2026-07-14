@@ -9,6 +9,10 @@
 //      △: お題の母音の後半部分と一致 → カウントなし、リストに追加
 //      ×: 不一致 → カウントなし、リストにも追加しない
 //      ○が4つ貯まったら結果リストを表示してそのラウンドは終了
+//   5. リッチメニューの「韻リストを見る」で、母音ごとにまとめた自分の韻リストをFlex Messageで確認できる
+//      (お題として出た単語は太字、重複は1つにまとめる)
+//   6. 奇数日の17時に「韻テスト」を配信。自分の韻リストの中から母音グループを1つランダムに選び、
+//      そのお題を表示。お題以外の単語をすべて思い出して送るまで終わらない(○/×判定)。
 //
 // 単語の読み(ひらがな/カタカナ)には kuromoji による形態素解析を使用しているため、
 // 未知語・固有名詞などは読みが不正確になる場合があります。
@@ -33,6 +37,7 @@ const USERS_KEY = 'users';
 const DAILY_STATE_KEY = 'daily-state';
 const SESSIONS_KEY = 'sessions';
 const RESULTS_LOG_KEY = 'results-log';
+const TEST_SESSIONS_KEY = 'test-sessions';
 
 // theme-words.json はコードと一緒にデプロイされる静的な参照データなので、ローカルファイルのままでよい
 const THEME_WORDS_FILE = path.join(__dirname, 'theme-words.json');
@@ -84,6 +89,19 @@ async function loadSessions() {
 }
 async function saveSessions(sessions) {
   return saveData(SESSIONS_KEY, sessions);
+}
+
+async function loadTestSessions() {
+  return loadData(TEST_SESSIONS_KEY, {});
+}
+async function saveTestSessions(testSessions) {
+  return saveData(TEST_SESSIONS_KEY, testSessions);
+}
+
+// Asia/Tokyo での「今日は何日か」を取得する(奇数日判定用)
+function getJstDayOfMonth() {
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Tokyo', day: 'numeric' });
+  return parseInt(fmt.format(new Date()), 10);
 }
 
 function shuffle(arr) {
@@ -291,6 +309,77 @@ function buildRhymeListFlexMessage(groups) {
   };
 }
 
+// --- 奇数日の17時に送る「韻テスト」(自分の韻リストからの復習クイズ) ---
+// お題(太字)とそれ以外の単語がどちらも存在する母音グループの中からランダムに1つ選び、
+// そのグループのお題をランダムに表示、お題以外の単語をすべて思い出せるまでテストする。
+async function pickRhymeTestForUser(userId) {
+  const groups = await buildRhymeGroups(userId);
+  const eligible = [];
+  for (const [vowels, wordMap] of groups) {
+    const themeWords = [];
+    const nonThemeWords = [];
+    for (const [word, isTheme] of wordMap) {
+      if (isTheme) themeWords.push(word);
+      else nonThemeWords.push(word);
+    }
+    if (themeWords.length > 0 && nonThemeWords.length > 0) {
+      eligible.push({ vowels, themeWords, nonThemeWords });
+    }
+  }
+  if (eligible.length === 0) return null;
+
+  const chosen = eligible[Math.floor(Math.random() * eligible.length)];
+  const themeWord = chosen.themeWords[Math.floor(Math.random() * chosen.themeWords.length)];
+  return { vowels: chosen.vowels, themeWord, nonThemeWords: chosen.nonThemeWords };
+}
+
+function formatRhymeTestMessage(testSession) {
+  return (
+    `【韻テスト】\n` +
+    `お題: ${testSession.themeWord}(母音: ${testSession.vowels})\n\n` +
+    `この母音の韻が、お題を除いてあと${testSession.remaining.length}個あります。\n` +
+    `思い出して送ってください！`
+  );
+}
+
+async function sendRhymeTestToAll() {
+  const users = await loadUsers();
+  if (users.length === 0) {
+    console.log('登録ユーザーがいません。韻テストの送信をスキップしました。');
+    return { ok: false, reason: 'no users' };
+  }
+
+  const testSessions = await loadTestSessions();
+  const results = [];
+  for (const userId of users) {
+    const picked = await pickRhymeTestForUser(userId);
+    if (!picked) {
+      console.log(`韻テスト対象なし (${userId}): お題以外の単語がある母音グループがまだありません`);
+      results.push({ userId, ok: false, reason: 'no eligible rhyme group' });
+      continue;
+    }
+    const testSession = {
+      vowels: picked.vowels,
+      themeWord: picked.themeWord,
+      remaining: shuffle(picked.nonThemeWords),
+      total: picked.nonThemeWords.length,
+      recalled: [],
+      startedAt: new Date().toISOString(),
+    };
+    testSessions[userId] = testSession;
+    try {
+      await client.pushMessage(userId, { type: 'text', text: formatRhymeTestMessage(testSession) });
+      results.push({ userId, ok: true });
+    } catch (err) {
+      const detail = (err && err.originalError && err.originalError.response && err.originalError.response.data) || err.message;
+      results.push({ userId, ok: false, error: detail });
+      console.error(`韻テスト送信失敗 (${userId}):`, detail);
+    }
+  }
+  await saveTestSessions(testSessions);
+  return { ok: true, results };
+}
+
 // --- 毎日 9:00 (Asia/Tokyo) に全ユーザーへお題を配信 ---
 async function sendDailyThemeToAll() {
   const theme = await pickDailyThemeWord();
@@ -326,6 +415,21 @@ cron.schedule(
   () => {
     console.log('毎日9時のお題配信を開始します');
     sendDailyThemeToAll();
+  },
+  { timezone: 'Asia/Tokyo' }
+);
+
+// 奇数日の17時だけ、韻テストを配信する
+cron.schedule(
+  '0 17 * * *',
+  () => {
+    const day = getJstDayOfMonth();
+    if (day % 2 === 1) {
+      console.log(`奇数日(${day}日)の17時、韻テストを配信します`);
+      sendRhymeTestToAll();
+    } else {
+      console.log(`偶数日(${day}日)の17時なので韻テストの配信はスキップします`);
+    }
   },
   { timezone: 'Asia/Tokyo' }
 );
@@ -388,6 +492,35 @@ async function handleEvent(event) {
     if (text === RHYME_LIST_TRIGGER_TEXT) {
       const groups = await buildRhymeGroups(userId);
       return client.replyMessage(event.replyToken, buildRhymeListFlexMessage(groups));
+    }
+
+    // 韻テスト(奇数日17時に配信)が進行中なら、そちらを優先して判定する。
+    // 全部答え終わるまでは通常のお題ゲームより韻テストを優先する。
+    const testSessions = await loadTestSessions();
+    const testSession = testSessions[userId];
+    if (testSession) {
+      if (testSession.remaining.includes(text)) {
+        testSession.remaining = testSession.remaining.filter((w) => w !== text);
+        testSession.recalled.push(text);
+        if (testSession.remaining.length === 0) {
+          delete testSessions[userId];
+          await saveTestSessions(testSessions);
+          return client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: `○ 正解！\n\n🎉 「${testSession.themeWord}」の韻を全部答えられました！お疲れさまでした。`,
+          });
+        }
+        testSessions[userId] = testSession;
+        await saveTestSessions(testSessions);
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `○ 正解！\n(残り ${testSession.remaining.length}個)`,
+        });
+      }
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: `× 違います。\n(残り ${testSession.remaining.length}個)`,
+      });
     }
 
     // トリガー以外のテキストは「単語での回答」として判定する
@@ -515,6 +648,14 @@ app.post('/send-daily-theme', async (req, res) => {
     return res.status(403).json({ error: 'forbidden' });
   }
   const result = await sendDailyThemeToAll();
+  res.json(result);
+});
+
+app.post('/send-rhyme-test', async (req, res) => {
+  if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const result = await sendRhymeTestToAll();
   res.json(result);
 });
 
