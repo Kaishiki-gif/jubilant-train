@@ -43,10 +43,12 @@ if (!hasUpstash) {
 }
 
 const RICHMENU_IMAGE_PATH = path.join(__dirname, 'richmenu.png');
-const RICHMENU_NAME = 'rhyme-theme-menu';
+const RICHMENU_NAME = 'rhyme-theme-menu-v2';
 // リッチメニューのボタンをタップすると、このテキストがメッセージとして送られてくる
 const THEME_TRIGGER_TEXT = '今日のお題を受け取る';
+const RHYME_LIST_TRIGGER_TEXT = '韻リストを見る';
 const REQUIRED_COUNT = 4;
+const MAX_RHYME_GROUPS = 30; // Flexメッセージが大きくなりすぎないようにする上限
 
 if (!config.channelAccessToken || !config.channelSecret) {
   console.warn('警告: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET が未設定です。.env を確認してください。');
@@ -196,6 +198,99 @@ async function appendResultLog(userId, session) {
   await saveData(RESULTS_LOG_KEY, log);
 }
 
+// --- ユーザーごとの「韻リスト」(母音ごとにまとめた単語一覧) ---
+// お題の単語(太字扱い)と、これまで判定された(○/△)単語を、母音の文字列ごとにグルーピングする。
+// 同じ母音グループ内で同じ単語が重複する場合は1つにまとめ、お題として出た単語は太字を優先する。
+async function buildRhymeGroups(userId) {
+  const groups = new Map(); // vowels -> Map<word, isTheme>
+
+  function addWord(vowels, word, isTheme) {
+    if (!vowels || !word) return;
+    if (!groups.has(vowels)) groups.set(vowels, new Map());
+    const wordMap = groups.get(vowels);
+    const existing = wordMap.get(word) || false;
+    wordMap.set(word, existing || isTheme);
+  }
+
+  function addRound(theme, list) {
+    if (theme) addWord(theme.vowels, theme.word, true);
+    for (const entry of list || []) {
+      const vowels = entry.vowels || extractVowels(entry.userReading || '');
+      addWord(vowels, entry.userWord, false);
+    }
+  }
+
+  const log = await loadData(RESULTS_LOG_KEY, []);
+  for (const entry of log) {
+    if (entry.userId === userId) {
+      addRound(entry.theme, entry.list);
+    }
+  }
+
+  // 現在進行中のラウンド(まだ4つ達成していない)の分も含める
+  const sessions = await loadSessions();
+  const currentSession = sessions[userId];
+  if (currentSession && currentSession.theme) {
+    addRound(currentSession.theme, currentSession.list);
+  }
+
+  return groups;
+}
+
+// 韻リストをLINEのFlex Message(お題の単語だけ太字で表示できる)に組み立てる
+function buildRhymeListFlexMessage(groups) {
+  const vowelKeys = Array.from(groups.keys()).sort();
+  const limitedKeys = vowelKeys.slice(0, MAX_RHYME_GROUPS);
+
+  const bodyContents = limitedKeys.map((vowels) => {
+    const wordMap = groups.get(vowels);
+    const words = Array.from(wordMap.entries()); // [word, isTheme][]
+    const spans = words.map(([word, isTheme], i) => ({
+      type: 'span',
+      text: i < words.length - 1 ? `${word}、` : word,
+      weight: isTheme ? 'bold' : 'regular',
+    }));
+    return {
+      type: 'box',
+      layout: 'vertical',
+      margin: 'lg',
+      contents: [
+        { type: 'text', text: `母音: ${vowels}`, weight: 'bold', size: 'sm', color: '#7B61FF' },
+        { type: 'text', wrap: true, size: 'sm', margin: 'xs', contents: spans },
+      ],
+    };
+  });
+
+  const omittedNote =
+    vowelKeys.length > MAX_RHYME_GROUPS
+      ? [{ type: 'text', text: `(他 ${vowelKeys.length - MAX_RHYME_GROUPS} グループは省略)`, size: 'xs', color: '#aaaaaa', margin: 'md' }]
+      : [];
+
+  return {
+    type: 'flex',
+    altText: '韻リスト',
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          { type: 'text', text: '📖 あなたの韻リスト', weight: 'bold', size: 'md' },
+          { type: 'text', text: '太字はお題として出た単語です', size: 'xs', color: '#aaaaaa', margin: 'sm' },
+        ],
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents:
+          bodyContents.length > 0
+            ? [...bodyContents, ...omittedNote]
+            : [{ type: 'text', text: 'まだ記録がありません。お題に挑戦してみましょう！', wrap: true, color: '#888888' }],
+      },
+    },
+  };
+}
+
 // --- 毎日 9:00 (Asia/Tokyo) に全ユーザーへお題を配信 ---
 async function sendDailyThemeToAll() {
   const theme = await pickDailyThemeWord();
@@ -290,6 +385,11 @@ async function handleEvent(event) {
       return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
     }
 
+    if (text === RHYME_LIST_TRIGGER_TEXT) {
+      const groups = await buildRhymeGroups(userId);
+      return client.replyMessage(event.replyToken, buildRhymeListFlexMessage(groups));
+    }
+
     // トリガー以外のテキストは「単語での回答」として判定する
     const sessions = await loadSessions();
     const session = sessions[userId];
@@ -366,7 +466,7 @@ app.get('/setup-richmenu', async (req, res) => {
   try {
     const existing = await client.getRichMenuList();
     for (const menu of existing) {
-      if (menu.name === RICHMENU_NAME || menu.name === 'daily-word-menu') {
+      if (menu.name === RICHMENU_NAME || menu.name === 'rhyme-theme-menu' || menu.name === 'daily-word-menu') {
         await client.deleteRichMenu(menu.richMenuId);
         console.log(`古いリッチメニューを削除: ${menu.richMenuId}`);
       }
@@ -376,11 +476,15 @@ app.get('/setup-richmenu', async (req, res) => {
       size: { width: 2500, height: 843 },
       selected: true,
       name: RICHMENU_NAME,
-      chatBarText: 'お題を受け取る',
+      chatBarText: 'メニュー',
       areas: [
         {
-          bounds: { x: 0, y: 0, width: 2500, height: 843 },
+          bounds: { x: 0, y: 0, width: 1250, height: 843 },
           action: { type: 'message', label: 'お題を受け取る', text: THEME_TRIGGER_TEXT },
+        },
+        {
+          bounds: { x: 1250, y: 0, width: 1250, height: 843 },
+          action: { type: 'message', label: '韻リストを見る', text: RHYME_LIST_TRIGGER_TEXT },
         },
       ],
     });
