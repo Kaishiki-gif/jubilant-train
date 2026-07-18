@@ -60,4 +60,20 @@ async function saveData(key, value) {
   fs.writeFileSync(localFile(key), JSON.stringify(value, null, 2));
 }
 
-module.exports = { loadData, saveData, hasUpstash };
+async function deleteData(key) {
+  if (redis) {
+    try {
+      await redis.del(key);
+    } catch (err) {
+      console.error(`Redisからの削除に失敗しました (${key}):`, err.message);
+    }
+    return;
+  }
+  try {
+    fs.unlinkSync(localFile(key));
+  } catch (e) {
+    // ファイルが無ければ何もしない
+  }
+}
+
+module.exports = { loadData, saveData, deleteData, hasUpstash };

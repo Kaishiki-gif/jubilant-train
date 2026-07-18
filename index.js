@@ -25,7 +25,7 @@ const cron = require('node-cron');
 const kuromoji = require('kuromoji');
 const { middleware, Client } = require('@line/bot-sdk');
 const { extractVowels, judge } = require('./kana');
-const { loadData, saveData, hasUpstash } = require('./storage');
+const { loadData, saveData, deleteData, hasUpstash } = require('./storage');
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -35,9 +35,16 @@ const config = {
 // 永続データ(Upstash Redisのキー名 / フォールバック時はローカルファイル名)
 const USERS_KEY = 'users';
 const DAILY_STATE_KEY = 'daily-state';
-const SESSIONS_KEY = 'sessions';
 const RESULTS_LOG_KEY = 'results-log';
-const TEST_SESSIONS_KEY = 'test-sessions';
+
+// セッションはユーザーごとに別々のキーに保存する(全員分を1つのオブジェクトにまとめると、
+// 複数の処理が同時に走ったときに読み込み→書き込みの間に他ユーザーの更新が上書きされてしまうため)
+function sessionKey(userId) {
+  return `session:${userId}`;
+}
+function testSessionKey(userId) {
+  return `test-session:${userId}`;
+}
 
 // theme-words.json はコードと一緒にデプロイされる静的な参照データなので、ローカルファイルのままでよい
 const THEME_WORDS_FILE = path.join(__dirname, 'theme-words.json');
@@ -84,18 +91,24 @@ function loadThemeWords() {
   return loadJSON(THEME_WORDS_FILE, []);
 }
 
-async function loadSessions() {
-  return loadData(SESSIONS_KEY, {});
+async function loadSession(userId) {
+  return loadData(sessionKey(userId), null);
 }
-async function saveSessions(sessions) {
-  return saveData(SESSIONS_KEY, sessions);
+async function saveSession(userId, session) {
+  return saveData(sessionKey(userId), session);
+}
+async function clearSession(userId) {
+  return deleteData(sessionKey(userId));
 }
 
-async function loadTestSessions() {
-  return loadData(TEST_SESSIONS_KEY, {});
+async function loadTestSession(userId) {
+  return loadData(testSessionKey(userId), null);
 }
-async function saveTestSessions(testSessions) {
-  return saveData(TEST_SESSIONS_KEY, testSessions);
+async function saveTestSession(userId, testSession) {
+  return saveData(testSessionKey(userId), testSession);
+}
+async function clearTestSession(userId) {
+  return deleteData(testSessionKey(userId));
 }
 
 // Asia/Tokyo での「今日は何日か」を取得する(奇数日判定用)
@@ -246,8 +259,7 @@ async function buildRhymeGroups(userId) {
   }
 
   // 現在進行中のラウンド(まだ4つ達成していない)の分も含める
-  const sessions = await loadSessions();
-  const currentSession = sessions[userId];
+  const currentSession = await loadSession(userId);
   if (currentSession && currentSession.theme) {
     addRound(currentSession.theme, currentSession.list);
   }
@@ -349,7 +361,6 @@ async function sendRhymeTestToAll() {
     return { ok: false, reason: 'no users' };
   }
 
-  const testSessions = await loadTestSessions();
   const results = [];
   for (const userId of users) {
     const picked = await pickRhymeTestForUser(userId);
@@ -366,7 +377,7 @@ async function sendRhymeTestToAll() {
       recalled: [],
       startedAt: new Date().toISOString(),
     };
-    testSessions[userId] = testSession;
+    await saveTestSession(userId, testSession);
     try {
       await client.pushMessage(userId, { type: 'text', text: formatRhymeTestMessage(testSession) });
       results.push({ userId, ok: true });
@@ -376,7 +387,6 @@ async function sendRhymeTestToAll() {
       console.error(`韻テスト送信失敗 (${userId}):`, detail);
     }
   }
-  await saveTestSessions(testSessions);
   return { ok: true, results };
 }
 
@@ -393,10 +403,9 @@ async function sendDailyThemeToAll() {
     return { ok: false, reason: 'no users' };
   }
 
-  const sessions = await loadSessions();
   const results = [];
   for (const userId of users) {
-    sessions[userId] = newSessionWithTheme(theme);
+    await saveSession(userId, newSessionWithTheme(theme));
     try {
       await client.pushMessage(userId, { type: 'text', text: formatThemeMessage(theme) });
       results.push({ userId, ok: true });
@@ -406,7 +415,6 @@ async function sendDailyThemeToAll() {
       console.error(`送信失敗 (${userId}):`, detail);
     }
   }
-  await saveSessions(sessions);
   return { ok: true, theme, results };
 }
 
@@ -478,14 +486,13 @@ async function handleEvent(event) {
     console.log(`メッセージ受信 (${userId}): "${text}"`);
 
     if (text === THEME_TRIGGER_TEXT) {
-      const sessions = await loadSessions();
-      const prevWord = sessions[userId] && sessions[userId].theme ? sessions[userId].theme.word : null;
+      const prevSession = await loadSession(userId);
+      const prevWord = prevSession && prevSession.theme ? prevSession.theme.word : null;
       const theme = pickRandomThemeWord(prevWord);
       if (!theme) {
         return client.replyMessage(event.replyToken, { type: 'text', text: 'お題データが見つかりませんでした。' });
       }
-      sessions[userId] = newSessionWithTheme(theme);
-      await saveSessions(sessions);
+      await saveSession(userId, newSessionWithTheme(theme));
       return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
     }
 
@@ -496,22 +503,19 @@ async function handleEvent(event) {
 
     // 韻テスト(奇数日17時に配信)が進行中なら、そちらを優先して判定する。
     // 全部答え終わるまでは通常のお題ゲームより韻テストを優先する。
-    const testSessions = await loadTestSessions();
-    const testSession = testSessions[userId];
+    const testSession = await loadTestSession(userId);
     if (testSession) {
       if (testSession.remaining.includes(text)) {
         testSession.remaining = testSession.remaining.filter((w) => w !== text);
         testSession.recalled.push(text);
         if (testSession.remaining.length === 0) {
-          delete testSessions[userId];
-          await saveTestSessions(testSessions);
+          await clearTestSession(userId);
           return client.replyMessage(event.replyToken, {
             type: 'text',
             text: `○ 正解！\n\n🎉 「${testSession.themeWord}」の韻を全部答えられました！お疲れさまでした。`,
           });
         }
-        testSessions[userId] = testSession;
-        await saveTestSessions(testSessions);
+        await saveTestSession(userId, testSession);
         return client.replyMessage(event.replyToken, {
           type: 'text',
           text: `○ 正解！\n(残り ${testSession.remaining.length}個)`,
@@ -523,9 +527,8 @@ async function handleEvent(event) {
       });
     }
 
-    // トリガー以外のテキストは「単語での回答」として判定する
-    const sessions = await loadSessions();
-    const session = sessions[userId];
+    // トリガー以外のテキストは「単語での回答」として判定する(ユーザーごとの最新セッションを都度読み込む)
+    const session = await loadSession(userId);
     if (!session || !session.theme) {
       return client.replyMessage(event.replyToken, {
         type: 'text',
@@ -578,12 +581,11 @@ async function handleEvent(event) {
     if (session.count >= REQUIRED_COUNT) {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark) + '\n\n' + formatResultMessage(session);
       await appendResultLog(userId, session);
-      delete sessions[userId]; // ラウンド終了、セッションをクリア
+      await clearSession(userId); // ラウンド終了、セッションをクリア
     } else {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark);
-      sessions[userId] = session;
+      await saveSession(userId, session);
     }
-    await saveSessions(sessions);
 
     return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
   }
