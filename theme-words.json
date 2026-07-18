@@ -165,7 +165,7 @@
     "word": "情熱",
     "reading": "じょうねつ",
     "mora": 4,
-    "vowels": "iueu"
+    "vowels": "oueu"
   },
   {
     "word": "覚悟",
@@ -177,7 +177,7 @@
     "word": "挑戦",
     "reading": "ちょうせん",
     "mora": 4,
-    "vowels": "iue"
+    "vowels": "oue"
   },
   {
     "word": "勇気",
@@ -207,7 +207,7 @@
     "word": "青春",
     "reading": "せいしゅん",
     "mora": 4,
-    "vowels": "eii"
+    "vowels": "eiu"
   },
   {
     "word": "物語",
@@ -231,7 +231,7 @@
     "word": "宇宙",
     "reading": "うちゅう",
     "mora": 3,
-    "vowels": "uiu"
+    "vowels": "uuu"
   },
   {
     "word": "光",
@@ -321,7 +321,7 @@
     "word": "蝶",
     "reading": "ちょう",
     "mora": 2,
-    "vowels": "iu"
+    "vowels": "ou"
   },
   {
     "word": "声",
@@ -531,6 +531,6 @@
     "word": "教室",
     "reading": "きょうしつ",
     "mora": 4,
-    "vowels": "iuiu"
+    "vowels": "ouiu"
   }
 ]
