@@ -13,6 +13,8 @@
 //      (お題として出た単語は太字、重複は1つにまとめる)
 //   6. 奇数日の17時に「韻テスト」を配信。自分の韻リストの中から母音グループを1つランダムに選び、
 //      そのお題を表示。お題以外の単語をすべて思い出して送るまで終わらない(○/×判定)。
+//   7. お題ゲーム・韻テストともに、最初の回答から30秒経過すると自動的に締め切る。
+//      締め切り後は roundId で照合し、次のラウンドに古い締め切り処理が誤って干渉しないようにしている。
 //
 // 単語の読み(ひらがな/カタカナ)には kuromoji による形態素解析を使用しているため、
 // 未知語・固有名詞などは読みが不正確になる場合があります。
@@ -61,6 +63,28 @@ const THEME_TRIGGER_TEXT = '今日のお題を受け取る';
 const RHYME_LIST_TRIGGER_TEXT = '韻リストを見る';
 const REQUIRED_COUNT = 4;
 const MAX_RHYME_GROUPS = 30; // Flexメッセージが大きくなりすぎないようにする上限
+const ANSWER_TIME_LIMIT_MS = 30 * 1000; // お題ゲーム・韻テスト共通の制限時間(最初の回答から30秒)
+
+// 制限時間タイマー(Node プロセスのメモリ上で管理。userId -> setTimeout のハンドル)。
+// サーバーが再起動するとタイマー自体は失われるが、その場合でも次にユーザーがメッセージを送った際に
+// deadline を過ぎているかその場でチェックして締め切る(保険)。
+const activeThemeTimers = new Map();
+const activeTestTimers = new Map();
+
+function clearThemeTimer(userId) {
+  const t = activeThemeTimers.get(userId);
+  if (t) {
+    clearTimeout(t);
+    activeThemeTimers.delete(userId);
+  }
+}
+function clearTestTimer(userId) {
+  const t = activeTestTimers.get(userId);
+  if (t) {
+    clearTimeout(t);
+    activeTestTimers.delete(userId);
+  }
+}
 
 if (!config.channelAccessToken || !config.channelSecret) {
   console.warn('警告: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET が未設定です。.env を確認してください。');
@@ -170,9 +194,24 @@ function pickRandomThemeWord(excludeWord) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+function makeRoundId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function newSessionWithTheme(theme) {
   // usedWords: このラウンドで既に使った単語(お題自身も含む)。同じ単語の使い回しを防ぐ。
-  return { theme, count: 0, list: [], usedWords: [theme.word], startedAt: new Date().toISOString() };
+  // roundId: このラウンド固有のID。制限時間タイマーが、既に終わった/切り替わった別のラウンドを
+  //          誤って締め切ってしまわないようにするための照合用。
+  // deadline: 最初の回答があった時刻から30秒後のタイムスタンプ(まだ未回答ならnull)。
+  return {
+    theme,
+    count: 0,
+    list: [],
+    usedWords: [theme.word],
+    startedAt: new Date().toISOString(),
+    roundId: makeRoundId(),
+    deadline: null,
+  };
 }
 
 function formatThemeMessage(theme) {
@@ -207,6 +246,49 @@ function formatResultMessage(session) {
   });
   lines.push('', 'リッチメニューの「お題を受け取る」から、またいつでも挑戦できます！');
   return lines.join('\n');
+}
+
+// 制限時間(30秒)になったときのお題ゲームの締め切りメッセージ
+function formatTimeUpThemeMessage(session) {
+  const lines = [`⏰ 制限時間になりました`, '', `お題: ${session.theme.word}(${session.theme.reading})`, ''];
+  if (session.list.length > 0) {
+    lines.push('【この回で答えられたもの】');
+    session.list.forEach((entry, i) => {
+      lines.push(`${i + 1}. ${entry.mark} ${session.theme.word} → ${entry.userWord}`);
+    });
+  } else {
+    lines.push('今回は1つも答えられませんでした。');
+  }
+  lines.push('', `カウント: ${session.count}/${REQUIRED_COUNT}`);
+  lines.push('', 'リッチメニューの「お題を受け取る」から、またいつでも挑戦できます！');
+  return lines.join('\n');
+}
+
+// お題ゲームの制限時間タイマーを(再)セットする。同じユーザーの古いタイマーがあれば先にキャンセルする。
+function scheduleThemeTimeout(userId, roundId) {
+  clearThemeTimer(userId);
+  const timer = setTimeout(() => {
+    finalizeThemeRoundByTimeout(userId, roundId);
+  }, ANSWER_TIME_LIMIT_MS);
+  activeThemeTimers.set(userId, timer);
+}
+
+// 制限時間経過でお題ゲームを締め切る。roundId が一致する場合のみ実行する
+// (すでに完了・切り替わった別のラウンドを誤って締め切らないようにするため)。
+async function finalizeThemeRoundByTimeout(userId, roundId) {
+  activeThemeTimers.delete(userId);
+  const session = await loadSession(userId);
+  if (!session || !session.theme || session.roundId !== roundId) {
+    return; // 既に終了しているか、別のラウンドに切り替わっている
+  }
+  const replyText = formatTimeUpThemeMessage(session);
+  await appendResultLog(userId, session); // 締め切りまでに答えられた分をリストに記録する
+  await clearSession(userId);
+  try {
+    await client.pushMessage(userId, { type: 'text', text: replyText });
+  } catch (err) {
+    console.error(`お題ゲームの締め切り通知に失敗 (${userId}):`, err.message);
+  }
 }
 
 // ラウンド終了時に、結果リストを results-log に集約保存する(管理者が /results で閲覧できる)
@@ -354,6 +436,49 @@ function formatRhymeTestMessage(testSession) {
   );
 }
 
+// 制限時間(30秒)になったときの韻テストの締め切りメッセージ(答えられた/答えられなかったものを表示)
+function formatTimeUpTestMessage(testSession) {
+  const lines = [`⏰ 制限時間になりました`, '', `お題: ${testSession.themeWord}(母音: ${testSession.vowels})`, ''];
+  lines.push('【答えられたもの】');
+  if (testSession.recalled.length > 0) {
+    testSession.recalled.forEach((w, i) => lines.push(`${i + 1}. ○ ${w}`));
+  } else {
+    lines.push('(なし)');
+  }
+  lines.push('', '【答えられなかったもの】');
+  if (testSession.remaining.length > 0) {
+    testSession.remaining.forEach((w, i) => lines.push(`${i + 1}. × ${w}`));
+  } else {
+    lines.push('(なし)');
+  }
+  return lines.join('\n');
+}
+
+// 韻テストの制限時間タイマーを(再)セットする
+function scheduleTestTimeout(userId, roundId) {
+  clearTestTimer(userId);
+  const timer = setTimeout(() => {
+    finalizeTestByTimeout(userId, roundId);
+  }, ANSWER_TIME_LIMIT_MS);
+  activeTestTimers.set(userId, timer);
+}
+
+// 制限時間経過で韻テストを締め切る。roundId が一致する場合のみ実行する。
+async function finalizeTestByTimeout(userId, roundId) {
+  activeTestTimers.delete(userId);
+  const testSession = await loadTestSession(userId);
+  if (!testSession || testSession.roundId !== roundId) {
+    return; // 既に終了しているか、別のラウンドに切り替わっている
+  }
+  const replyText = formatTimeUpTestMessage(testSession);
+  await clearTestSession(userId);
+  try {
+    await client.pushMessage(userId, { type: 'text', text: replyText });
+  } catch (err) {
+    console.error(`韻テストの締め切り通知に失敗 (${userId}):`, err.message);
+  }
+}
+
 async function sendRhymeTestToAll() {
   const users = await loadUsers();
   if (users.length === 0) {
@@ -369,6 +494,7 @@ async function sendRhymeTestToAll() {
       results.push({ userId, ok: false, reason: 'no eligible rhyme group' });
       continue;
     }
+    clearTestTimer(userId); // 前回分のタイマーが残っていれば念のためキャンセルする
     const testSession = {
       vowels: picked.vowels,
       themeWord: picked.themeWord,
@@ -376,6 +502,8 @@ async function sendRhymeTestToAll() {
       total: picked.nonThemeWords.length,
       recalled: [],
       startedAt: new Date().toISOString(),
+      roundId: makeRoundId(),
+      deadline: null,
     };
     await saveTestSession(userId, testSession);
     try {
@@ -405,6 +533,7 @@ async function sendDailyThemeToAll() {
 
   const results = [];
   for (const userId of users) {
+    clearThemeTimer(userId); // 前回分のタイマーが残っていれば念のためキャンセルする
     await saveSession(userId, newSessionWithTheme(theme));
     try {
       await client.pushMessage(userId, { type: 'text', text: formatThemeMessage(theme) });
@@ -492,6 +621,7 @@ async function handleEvent(event) {
       if (!theme) {
         return client.replyMessage(event.replyToken, { type: 'text', text: 'お題データが見つかりませんでした。' });
       }
+      clearThemeTimer(userId); // 前のラウンドのタイマーが残っていれば念のためキャンセルする
       await saveSession(userId, newSessionWithTheme(theme));
       return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
     }
@@ -505,17 +635,37 @@ async function handleEvent(event) {
     // 全部答え終わるまでは通常のお題ゲームより韻テストを優先する。
     const testSession = await loadTestSession(userId);
     if (testSession) {
-      if (testSession.remaining.includes(text)) {
+      // 保険: サーバー再起動などでタイマーが発火できなかった場合、次のメッセージ受信時に締め切る
+      if (testSession.deadline && Date.now() >= testSession.deadline) {
+        const timeUpText = formatTimeUpTestMessage(testSession);
+        clearTestTimer(userId);
+        await clearTestSession(userId);
+        return client.replyMessage(event.replyToken, { type: 'text', text: timeUpText });
+      }
+
+      const isCorrect = testSession.remaining.includes(text);
+      if (isCorrect) {
         testSession.remaining = testSession.remaining.filter((w) => w !== text);
         testSession.recalled.push(text);
-        if (testSession.remaining.length === 0) {
-          await clearTestSession(userId);
-          return client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: `○ 正解！\n\n🎉 「${testSession.themeWord}」の韻を全部答えられました！お疲れさまでした。`,
-          });
-        }
-        await saveTestSession(userId, testSession);
+      }
+
+      // 最初の回答のタイミングで制限時間(30秒)のカウントダウンを開始する
+      if (!testSession.deadline) {
+        testSession.deadline = Date.now() + ANSWER_TIME_LIMIT_MS;
+        scheduleTestTimeout(userId, testSession.roundId);
+      }
+
+      if (isCorrect && testSession.remaining.length === 0) {
+        clearTestTimer(userId);
+        await clearTestSession(userId);
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `○ 正解！\n\n🎉 「${testSession.themeWord}」の韻を全部答えられました！お疲れさまでした。`,
+        });
+      }
+
+      await saveTestSession(userId, testSession);
+      if (isCorrect) {
         return client.replyMessage(event.replyToken, {
           type: 'text',
           text: `○ 正解！\n(残り ${testSession.remaining.length}個)`,
@@ -535,6 +685,16 @@ async function handleEvent(event) {
         text: 'まずはリッチメニューの「お題を受け取る」から始めてください！',
       });
     }
+
+    // 保険: サーバー再起動などでタイマーが発火できなかった場合、次のメッセージ受信時に締め切る
+    if (session.deadline && Date.now() >= session.deadline) {
+      const timeUpText = formatTimeUpThemeMessage(session);
+      clearThemeTimer(userId);
+      await appendResultLog(userId, session);
+      await clearSession(userId);
+      return client.replyMessage(event.replyToken, { type: 'text', text: timeUpText });
+    }
+
     // 古いセッション(usedWords導入前)との互換用
     if (!Array.isArray(session.usedWords)) {
       session.usedWords = [session.theme.word];
@@ -577,9 +737,16 @@ async function handleEvent(event) {
       session.list.push({ mark, userWord: text, userReading: userReadingHiragana });
     }
 
+    // 最初の回答のタイミングで制限時間(30秒)のカウントダウンを開始する
+    if (!session.deadline) {
+      session.deadline = Date.now() + ANSWER_TIME_LIMIT_MS;
+      scheduleThemeTimeout(userId, session.roundId);
+    }
+
     let replyText;
     if (session.count >= REQUIRED_COUNT) {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark) + '\n\n' + formatResultMessage(session);
+      clearThemeTimer(userId); // 時間内に完了したので、保留中の締め切りタイマーは不要
       await appendResultLog(userId, session);
       await clearSession(userId); // ラウンド終了、セッションをクリア
     } else {
