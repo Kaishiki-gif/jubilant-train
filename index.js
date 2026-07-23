@@ -534,6 +534,10 @@ async function sendDailyThemeToAll() {
   const results = [];
   for (const userId of users) {
     clearThemeTimer(userId); // 前回分のタイマーが残っていれば念のためキャンセルする
+    // 放置されたままの韻テストが残っていると、次に送る単語がそちらの判定に横取りされてしまうため、
+    // 新しいお題を配信するタイミングで韻テストも片付けておく
+    clearTestTimer(userId);
+    await clearTestSession(userId);
     await saveSession(userId, newSessionWithTheme(theme));
     try {
       await client.pushMessage(userId, { type: 'text', text: formatThemeMessage(theme) });
@@ -622,6 +626,10 @@ async function handleEvent(event) {
         return client.replyMessage(event.replyToken, { type: 'text', text: 'お題データが見つかりませんでした。' });
       }
       clearThemeTimer(userId); // 前のラウンドのタイマーが残っていれば念のためキャンセルする
+      // 放置されたままの韻テストが残っていると、次に送る単語がそちらの判定に横取りされてしまうため、
+      // 新しいお題を受け取るタイミングで韻テストも片付けておく
+      clearTestTimer(userId);
+      await clearTestSession(userId);
       await saveSession(userId, newSessionWithTheme(theme));
       return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
     }
