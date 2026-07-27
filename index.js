@@ -38,6 +38,8 @@ const config = {
 const USERS_KEY = 'users';
 const DAILY_STATE_KEY = 'daily-state';
 const RESULTS_LOG_KEY = 'results-log';
+const ACTIVITY_LOG_KEY = 'activity-log';
+const MAX_ACTIVITY_ENTRIES = 500; // 保存しすぎないように上限を設ける
 
 // セッションはユーザーごとに別々のキーに保存する(全員分を1つのオブジェクトにまとめると、
 // 複数の処理が同時に走ったときに読み込み→書き込みの間に他ユーザーの更新が上書きされてしまうため)
@@ -133,6 +135,56 @@ async function saveTestSession(userId, testSession) {
 }
 async function clearTestSession(userId) {
   return deleteData(testSessionKey(userId));
+}
+
+// --- 人が読みやすい「活動ログ」(Renderの生ログの代わりにブラウザで見られるもの) ---
+// follow/unfollow、送信、回答判定、締め切りなどの出来事を時系列で記録する。
+async function logActivity(entry) {
+  try {
+    const log = await loadData(ACTIVITY_LOG_KEY, []);
+    log.push({ ...entry, at: new Date().toISOString() });
+    if (log.length > MAX_ACTIVITY_ENTRIES) {
+      log.splice(0, log.length - MAX_ACTIVITY_ENTRIES);
+    }
+    await saveData(ACTIVITY_LOG_KEY, log);
+  } catch (err) {
+    console.error('活動ログの記録に失敗しました:', err.message);
+  }
+}
+
+// 活動ログの1件を、人が読める日本語の一文に変換する
+function describeActivity(entry, displayName) {
+  const name = displayName || entry.userId || '(不明)';
+  switch (entry.type) {
+    case 'follow':
+      return `👋 ${name} さんが友だち追加しました`;
+    case 'unfollow':
+      return `👋 ${name} さんが友だち解除しました`;
+    case 'theme_sent':
+      return `📨 ${name} さんにお題「${entry.theme}」を送信しました(${entry.source === 'daily' ? '毎日9時の自動配信' : 'ボタンで受け取り'})`;
+    case 'theme_send_failed':
+      return `⚠️ ${name} さんへのお題配信に失敗しました`;
+    case 'test_sent':
+      return `📨 ${name} さんに韻テスト(お題「${entry.themeWord}」/母音: ${entry.vowels}、残り${entry.total}個)を送信しました`;
+    case 'test_send_failed':
+      return `⚠️ ${name} さんへの韻テスト配信に失敗しました`;
+    case 'answer': {
+      const ctx = entry.context === 'test' ? '韻テスト' : 'お題ゲーム';
+      return `${entry.mark} ${name} さんが「${entry.text}」と回答しました(${ctx})`;
+    }
+    case 'rejected_used_word':
+      return `🚫 ${name} さんの「${entry.text}」は使用済み/お題と同じ単語のため却下しました`;
+    case 'round_complete':
+      return `🎉 ${name} さんがお題「${entry.theme}」で4つ達成しました`;
+    case 'round_timeout':
+      return `⏰ ${name} さんのお題「${entry.theme}」が制限時間で締め切られました(${entry.count}/${REQUIRED_COUNT})`;
+    case 'test_complete':
+      return `🎉 ${name} さんが韻テスト「${entry.themeWord}」を完答しました`;
+    case 'test_timeout':
+      return `⏰ ${name} さんの韻テスト「${entry.themeWord}」が制限時間で締め切られました(答えられた: ${entry.recalledCount}/${entry.totalCount})`;
+    default:
+      return `${name}: ${JSON.stringify(entry)}`;
+  }
 }
 
 // Asia/Tokyo での「今日は何日か」を取得する(奇数日判定用)
@@ -284,6 +336,7 @@ async function finalizeThemeRoundByTimeout(userId, roundId) {
   const replyText = formatTimeUpThemeMessage(session);
   await appendResultLog(userId, session); // 締め切りまでに答えられた分をリストに記録する
   await clearSession(userId);
+  await logActivity({ type: 'round_timeout', userId, theme: session.theme.word, count: session.count });
   try {
     await client.pushMessage(userId, { type: 'text', text: replyText });
   } catch (err) {
@@ -472,6 +525,13 @@ async function finalizeTestByTimeout(userId, roundId) {
   }
   const replyText = formatTimeUpTestMessage(testSession);
   await clearTestSession(userId);
+  await logActivity({
+    type: 'test_timeout',
+    userId,
+    themeWord: testSession.themeWord,
+    recalledCount: testSession.recalled.length,
+    totalCount: testSession.total,
+  });
   try {
     await client.pushMessage(userId, { type: 'text', text: replyText });
   } catch (err) {
@@ -509,10 +569,12 @@ async function sendRhymeTestToAll() {
     try {
       await client.pushMessage(userId, { type: 'text', text: formatRhymeTestMessage(testSession) });
       results.push({ userId, ok: true });
+      await logActivity({ type: 'test_sent', userId, themeWord: testSession.themeWord, vowels: testSession.vowels, total: testSession.total });
     } catch (err) {
       const detail = (err && err.originalError && err.originalError.response && err.originalError.response.data) || err.message;
       results.push({ userId, ok: false, error: detail });
       console.error(`韻テスト送信失敗 (${userId}):`, detail);
+      await logActivity({ type: 'test_send_failed', userId });
     }
   }
   return { ok: true, results };
@@ -542,10 +604,12 @@ async function sendDailyThemeToAll() {
     try {
       await client.pushMessage(userId, { type: 'text', text: formatThemeMessage(theme) });
       results.push({ userId, ok: true });
+      await logActivity({ type: 'theme_sent', userId, theme: theme.word, source: 'daily' });
     } catch (err) {
       const detail = (err && err.originalError && err.originalError.response && err.originalError.response.data) || err.message;
       results.push({ userId, ok: false, error: detail });
       console.error(`送信失敗 (${userId}):`, detail);
+      await logActivity({ type: 'theme_send_failed', userId });
     }
   }
   return { ok: true, theme, results };
@@ -596,6 +660,7 @@ async function handleEvent(event) {
       await saveUsers(users);
       console.log(`新しい友だち登録: ${userId}`);
     }
+    await logActivity({ type: 'follow', userId });
     return client.replyMessage(event.replyToken, {
       type: 'text',
       text:
@@ -610,6 +675,7 @@ async function handleEvent(event) {
     const users = await loadUsers();
     await saveUsers(users.filter((id) => id !== userId));
     console.log(`友だち解除: ${userId}`);
+    await logActivity({ type: 'unfollow', userId });
     return null;
   }
 
@@ -631,6 +697,7 @@ async function handleEvent(event) {
       clearTestTimer(userId);
       await clearTestSession(userId);
       await saveSession(userId, newSessionWithTheme(theme));
+      await logActivity({ type: 'theme_sent', userId, theme: theme.word, source: 'manual' });
       return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
     }
 
@@ -663,9 +730,12 @@ async function handleEvent(event) {
         scheduleTestTimeout(userId, testSession.roundId);
       }
 
+      await logActivity({ type: 'answer', userId, text, mark: isCorrect ? '○' : '×', context: 'test' });
+
       if (isCorrect && testSession.remaining.length === 0) {
         clearTestTimer(userId);
         await clearTestSession(userId);
+        await logActivity({ type: 'test_complete', userId, themeWord: testSession.themeWord });
         return client.replyMessage(event.replyToken, {
           type: 'text',
           text: `○ 正解！\n\n🎉 「${testSession.themeWord}」の韻を全部答えられました！お疲れさまでした。`,
@@ -712,6 +782,7 @@ async function handleEvent(event) {
     // (判定すら行わず即座に却下し、カウント・リストには一切影響しない)
     if (session.usedWords.includes(text)) {
       console.log(`使用済み単語のため却下 (${userId}): "${text}" (既に使用: ${session.usedWords.join(', ')})`);
+      await logActivity({ type: 'rejected_used_word', userId, text });
       return client.replyMessage(event.replyToken, {
         type: 'text',
         text:
@@ -734,6 +805,7 @@ async function handleEvent(event) {
     const userVowels = extractVowels(userReadingKatakana);
     const mark = judge(userVowels, session.theme.vowels);
     console.log(`判定 (${userId}): "${text}"(${userVowels}) vs お題"${session.theme.word}"(${session.theme.vowels}) => ${mark}`);
+    await logActivity({ type: 'answer', userId, text, mark, context: 'game' });
 
     // 判定結果にかかわらず、送った単語は「使用済み」として記録する(次回以降の使い回しを防ぐ)
     session.usedWords.push(text);
@@ -757,6 +829,7 @@ async function handleEvent(event) {
       clearThemeTimer(userId); // 時間内に完了したので、保留中の締め切りタイマーは不要
       await appendResultLog(userId, session);
       await clearSession(userId); // ラウンド終了、セッションをクリア
+      await logActivity({ type: 'round_complete', userId, theme: session.theme.word });
     } else {
       replyText = formatJudgmentMessage(session, text, userReadingHiragana, userVowels, mark);
       await saveSession(userId, session);
@@ -834,6 +907,57 @@ app.post('/send-rhyme-test', async (req, res) => {
   }
   const result = await sendRhymeTestToAll();
   res.json(result);
+});
+
+// 人が読みやすい活動ログを一覧で見られるページ(スマホのブラウザでもOK)
+app.get('/activity', async (req, res) => {
+  if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const log = await loadData(ACTIVITY_LOG_KEY, []);
+  const recent = [...log].reverse().slice(0, 200);
+
+  // 表示名をまとめて解決する(同じuserIdへの問い合わせは1回だけにする)
+  const nameCache = new Map();
+  for (const entry of recent) {
+    if (entry.userId && !nameCache.has(entry.userId)) {
+      try {
+        const profile = await client.getProfile(entry.userId);
+        nameCache.set(entry.userId, profile.displayName || entry.userId);
+      } catch (e) {
+        nameCache.set(entry.userId, entry.userId);
+      }
+    }
+  }
+
+  const rows = recent
+    .map((entry) => {
+      const date = new Date(entry.at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+      const desc = describeActivity(entry, entry.userId ? nameCache.get(entry.userId) : null);
+      return `<div class="row"><div class="time">${date}</div><div class="desc">${desc}</div></div>`;
+    })
+    .join('');
+
+  res.send(`<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>活動ログ</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background:#f2f2f5; margin:0; padding:16px; color:#222; }
+  h1 { font-size:20px; margin-bottom:16px; }
+  .row { background:#fff; border-radius:10px; padding:10px 14px; margin-bottom:8px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .time { font-size:11px; color:#999; margin-bottom:2px; }
+  .desc { font-size:14px; line-height:1.5; }
+  .empty { color:#888; text-align:center; margin-top:40px; }
+</style>
+</head>
+<body>
+  <h1>活動ログ(新しい順・最大200件)</h1>
+  ${recent.length === 0 ? '<div class="empty">まだ記録がありません</div>' : rows}
+</body>
+</html>`);
 });
 
 // みんなの「4つ達成」結果を一覧で見られるページ(スマホのブラウザでもOK)
