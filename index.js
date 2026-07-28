@@ -15,6 +15,10 @@
 //      そのお題を表示。お題以外の単語をすべて思い出して送るまで終わらない(○/×判定)。
 //   7. お題ゲーム・韻テストともに、最初の回答から30秒経過すると自動的に締め切る。
 //      締め切り後は roundId で照合し、次のラウンドに古い締め切り処理が誤って干渉しないようにしている。
+//   8. テキストの代わりに音声メッセージで回答することもできる。OpenAI Whisper APIで文字起こしし、
+//      その結果を通常のテキスト回答と全く同じ判定ロジックに流し込む(要 OPENAI_API_KEY 環境変数)。
+//      聞き取った単語は返信メッセージの先頭に「🎤「〇〇」と聞き取りました」として必ず表示し、
+//      誤認識時にユーザーが気づけるようにしている。
 //
 // 単語の読み(ひらがな/カタカナ)には kuromoji による形態素解析を使用しているため、
 // 未知語・固有名詞などは読みが不正確になる場合があります。
@@ -219,6 +223,43 @@ async function getReadingKatakana(text) {
   const tokenizer = await tokenizerPromise;
   const tokens = tokenizer.tokenize(text);
   return tokens.map((t) => t.reading || t.surface_form).join('');
+}
+
+// --- 音声メッセージの文字起こし(OpenAI Whisper API) ---
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+async function transcribeAudioMessage(messageId) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY が未設定のため、音声メッセージを認識できません。');
+  }
+
+  // LINEから音声データ(m4a)をダウンロード
+  const stream = await client.getMessageContent(messageId);
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  const audioBuffer = Buffer.concat(chunks);
+
+  // Whisper APIに送って文字起こし
+  const formData = new FormData();
+  formData.append('file', new Blob([audioBuffer], { type: 'audio/m4a' }), 'voice.m4a');
+  formData.append('model', 'whisper-1');
+  formData.append('language', 'ja');
+
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Whisper APIエラー: ${res.status} ${errText}`);
+  }
+
+  const data = await res.json();
+  return (data.text || '').trim();
 }
 
 // --- お題(テーマ単語)のローテーション ---
@@ -679,10 +720,33 @@ async function handleEvent(event) {
     return null;
   }
 
-  if (event.type === 'message' && event.message && event.message.type === 'text') {
+  if (event.type === 'message' && event.message && (event.message.type === 'text' || event.message.type === 'audio')) {
     const userId = event.source.userId;
-    const text = event.message.text.trim();
-    console.log(`メッセージ受信 (${userId}): "${text}"`);
+    const isVoiceInput = event.message.type === 'audio';
+    let text;
+    if (isVoiceInput) {
+      try {
+        text = await transcribeAudioMessage(event.message.id);
+      } catch (err) {
+        console.error('音声認識エラー:', err.message);
+        await logActivity({ type: 'voice_transcription_failed', userId, error: err.message });
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: '音声をうまく認識できませんでした。もう一度話しかけるか、テキストで送ってみてください。',
+        });
+      }
+      if (!text) {
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: '音声を聞き取れませんでした。もう一度お願いします。',
+        });
+      }
+    } else {
+      text = event.message.text.trim();
+    }
+    // 音声由来の場合は、聞き取った単語をあとで返信に添えて透明性を持たせる
+    const voicePrefix = isVoiceInput ? `🎤「${text}」と聞き取りました\n\n` : '';
+    console.log(`メッセージ受信 (${userId}, ${isVoiceInput ? '音声' : 'テキスト'}): "${text}"`);
 
     if (text === THEME_TRIGGER_TEXT) {
       const prevSession = await loadSession(userId);
@@ -738,7 +802,7 @@ async function handleEvent(event) {
         await logActivity({ type: 'test_complete', userId, themeWord: testSession.themeWord });
         return client.replyMessage(event.replyToken, {
           type: 'text',
-          text: `○ 正解！\n\n🎉 「${testSession.themeWord}」の韻を全部答えられました！お疲れさまでした。`,
+          text: `${voicePrefix}○ 正解！\n\n🎉 「${testSession.themeWord}」の韻を全部答えられました！お疲れさまでした。`,
         });
       }
 
@@ -746,12 +810,12 @@ async function handleEvent(event) {
       if (isCorrect) {
         return client.replyMessage(event.replyToken, {
           type: 'text',
-          text: `○ 正解！\n(残り ${testSession.remaining.length}個)`,
+          text: `${voicePrefix}○ 正解！\n(残り ${testSession.remaining.length}個)`,
         });
       }
       return client.replyMessage(event.replyToken, {
         type: 'text',
-        text: `× 違います。\n(残り ${testSession.remaining.length}個)`,
+        text: `${voicePrefix}× 違います。\n(残り ${testSession.remaining.length}個)`,
       });
     }
 
@@ -786,6 +850,7 @@ async function handleEvent(event) {
       return client.replyMessage(event.replyToken, {
         type: 'text',
         text:
+          voicePrefix +
           `「${text}」は既に使った単語(またはお題と同じ単語)なので使えません。\n` +
           `別の単語を送ってください。\n(カウント: ${session.count}/${REQUIRED_COUNT})`,
       });
@@ -798,7 +863,7 @@ async function handleEvent(event) {
       console.error('読み推定エラー:', err);
       return client.replyMessage(event.replyToken, {
         type: 'text',
-        text: '単語の読みをうまく判定できませんでした。ひらがなで送ってみてください。',
+        text: `${voicePrefix}単語の読みをうまく判定できませんでした。ひらがなで送ってみてください。`,
       });
     }
     const userReadingHiragana = userReadingKatakana.replace(/[ァ-ヶ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0x60));
@@ -835,7 +900,7 @@ async function handleEvent(event) {
       await saveSession(userId, session);
     }
 
-    return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
+    return client.replyMessage(event.replyToken, { type: 'text', text: voicePrefix + replyText });
   }
 
   return null;
