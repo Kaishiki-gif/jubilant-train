@@ -19,6 +19,9 @@
 //      その結果を通常のテキスト回答と全く同じ判定ロジックに流し込む(要 OPENAI_API_KEY 環境変数)。
 //      聞き取った単語は返信メッセージの先頭に「🎤「〇〇」と聞き取りました」として必ず表示し、
 //      誤認識時にユーザーが気づけるようにしている。
+//   9. 写真ラップバトル: ユーザーが写真を送る(リッチメニュー「ラップバトル」→カメラ起動、またはトークから直接)と、
+//      AIが写真の主役(生物・非生物・概念を問わない)を判定し、そのモノになりきって「4×2分割法」の8小節で先攻する。
+//      ユーザーはテキストか音声で8小節を返し、AI→人→AI→人の計4本でバトル終了、最後に講評を返す(battle.js)。
 //
 // 単語の読み(ひらがな/カタカナ)には kuromoji による形態素解析を使用しているため、
 // 未知語・固有名詞などは読みが不正確になる場合があります。
@@ -32,6 +35,7 @@ const kuromoji = require('kuromoji');
 const { middleware, Client } = require('@line/bot-sdk');
 const { extractVowels, judge } = require('./kana');
 const { loadData, saveData, deleteData, hasUpstash } = require('./storage');
+const { startBattleFromImage, generateNextVerse, generateReview } = require('./battle');
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -53,6 +57,16 @@ function sessionKey(userId) {
 function testSessionKey(userId) {
   return `test-session:${userId}`;
 }
+function battleKey(userId) {
+  return `battle:${userId}`;
+}
+
+// --- 写真ラップバトルの設定 ---
+const BATTLE_TRIGGER_TEXT = 'ラップバトル';
+const BATTLE_LOG_KEY = 'battle-log';
+const BATTLE_TOTAL_VERSES = 4; // AI→人→AI→人 の計4本(8小節×4)
+const BATTLE_EXPIRE_MS = 30 * 60 * 1000; // 30分放置されたバトルは無効にする
+const BATTLE_BUSY_MS = 60 * 1000; // AIが生成中の間に届いた追加メッセージは受け付けない
 
 // theme-words.json はコードと一緒にデプロイされる静的な参照データなので、ローカルファイルのままでよい
 const THEME_WORDS_FILE = path.join(__dirname, 'theme-words.json');
@@ -63,7 +77,7 @@ if (!hasUpstash) {
 }
 
 const RICHMENU_IMAGE_PATH = path.join(__dirname, 'richmenu.png');
-const RICHMENU_NAME = 'rhyme-theme-menu-v2';
+const RICHMENU_NAME = 'rhyme-theme-menu-v3';
 // リッチメニューのボタンをタップすると、このテキストがメッセージとして送られてくる
 const THEME_TRIGGER_TEXT = '今日のお題を受け取る';
 const RHYME_LIST_TRIGGER_TEXT = '韻リストを見る';
@@ -141,6 +155,16 @@ async function clearTestSession(userId) {
   return deleteData(testSessionKey(userId));
 }
 
+async function loadBattle(userId) {
+  return loadData(battleKey(userId), null);
+}
+async function saveBattle(userId, battle) {
+  return saveData(battleKey(userId), battle);
+}
+async function clearBattle(userId) {
+  return deleteData(battleKey(userId));
+}
+
 // --- 人が読みやすい「活動ログ」(Renderの生ログの代わりにブラウザで見られるもの) ---
 // follow/unfollow、送信、回答判定、締め切りなどの出来事を時系列で記録する。
 async function logActivity(entry) {
@@ -186,6 +210,14 @@ function describeActivity(entry, displayName) {
       return `🎉 ${name} さんが韻テスト「${entry.themeWord}」を完答しました`;
     case 'test_timeout':
       return `⏰ ${name} さんの韻テスト「${entry.themeWord}」が制限時間で締め切られました(答えられた: ${entry.recalledCount}/${entry.totalCount})`;
+    case 'battle_start':
+      return `📸 ${name} さんが写真ラップバトルを開始しました(相手: ${entry.opponent})`;
+    case 'battle_verse':
+      return `🎤 ${name} さんが「${entry.opponent}」に${entry.verseNo}本目を返しました${entry.voice ? '(音声)' : ''}`;
+    case 'battle_complete':
+      return `🏁 ${name} さんが「${entry.opponent}」とのラップバトルを最後までやり切りました`;
+    case 'battle_failed':
+      return `⚠️ ${name} さんのラップバトルでAIの生成に失敗しました(${entry.stage})`;
     default:
       return `${name}: ${JSON.stringify(entry)}`;
   }
@@ -260,6 +292,189 @@ async function transcribeAudioMessage(messageId) {
 
   const data = await res.json();
   return (data.text || '').trim();
+}
+
+// --- 写真ラップバトル ---
+
+async function downloadMessageContent(messageId) {
+  const stream = await client.getMessageContent(messageId);
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+// AIの生成待ちの間、トーク画面に「…」のローディング表示を出す(失敗しても処理は続ける)
+async function showLoading(userId, seconds = 30) {
+  try {
+    await fetch('https://api.line.me/v2/bot/chat/loading/start', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.channelAccessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ chatId: userId, loadingSeconds: seconds }),
+    });
+  } catch (err) {
+    console.error('ローディング表示に失敗しました:', err.message);
+  }
+}
+
+const BATTLE_CAMERA_QUICK_REPLY = {
+  items: [
+    { type: 'action', action: { type: 'camera', label: '📸 カメラで撮る' } },
+    { type: 'action', action: { type: 'cameraRoll', label: '🖼 写真を選ぶ' } },
+  ],
+};
+
+function formatAiVerseMessage(battle, verseLines, rhymeNote, verseNo) {
+  const isLastAiVerse = verseNo >= BATTLE_TOTAL_VERSES - 1;
+  const lines = [`🎤 ${battle.opponent}(${verseNo}本目 / 全${BATTLE_TOTAL_VERSES}本)`, '', ...verseLines];
+  if (rhymeNote) lines.push('', `(韻: ${rhymeNote})`);
+  lines.push(
+    '',
+    isLastAiVerse
+      ? '👉 あなたのラスト8小節！テキストかボイスで、1通にまとめて返してください。'
+      : '👉 あなたの番！8小節をテキストかボイスで、1通にまとめて返してください。'
+  );
+  return lines.join('\n');
+}
+
+async function appendBattleLog(userId, battle) {
+  const log = await loadData(BATTLE_LOG_KEY, []);
+  let displayName = userId;
+  try {
+    const profile = await client.getProfile(userId);
+    displayName = profile.displayName || userId;
+  } catch (e) {
+    // 表示名が取れなくても記録は続ける
+  }
+  log.push({ userId, displayName, ...battle, completedAt: new Date().toISOString() });
+  await saveData(BATTLE_LOG_KEY, log);
+}
+
+// 写真を受け取ったら、主役を判定して先攻の8小節を返す(進行中のバトルがあっても新しく始め直す)
+async function handleBattleImage(event) {
+  const userId = event.source.userId;
+  await showLoading(userId, 40);
+
+  let opening;
+  try {
+    const imageBuffer = await downloadMessageContent(event.message.id);
+    opening = await startBattleFromImage(imageBuffer, 'image/jpeg');
+  } catch (err) {
+    console.error('ラップバトル開始エラー:', err.message);
+    await logActivity({ type: 'battle_failed', userId, stage: 'start', error: err.message });
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '写真からバトル相手をうまく作れませんでした。もう一度撮ってみてください。',
+      quickReply: BATTLE_CAMERA_QUICK_REPLY,
+    });
+  }
+
+  // 他のゲームが進行中だと、次に送るバースがそちらに横取りされるので片付けておく
+  clearThemeTimer(userId);
+  clearTestTimer(userId);
+  await clearSession(userId);
+  await clearTestSession(userId);
+
+  const verseText = opening.verse.join('\n');
+  const battle = {
+    opponent: opening.opponent,
+    reason: opening.reason,
+    verses: [{ by: 'ai', text: verseText, rhymeNote: opening.rhymeNote }],
+    startedAt: new Date().toISOString(),
+    lastActiveAt: Date.now(),
+    busyUntil: null,
+  };
+  await saveBattle(userId, battle);
+  await logActivity({ type: 'battle_start', userId, opponent: battle.opponent });
+
+  const header = `🎯 今回の相手は「${battle.opponent}」\n${battle.reason ? `(${battle.reason})` : ''}`.trim();
+  return client.replyMessage(event.replyToken, [
+    { type: 'text', text: header },
+    { type: 'text', text: formatAiVerseMessage(battle, opening.verse, opening.rhymeNote, 1) },
+  ]);
+}
+
+// バトル中に届いたユーザーのバース(テキスト or 音声の文字起こし)を処理する
+async function handleBattleVerse(event, battle, text, voicePrefix, isVoiceInput) {
+  const userId = event.source.userId;
+
+  if (battle.busyUntil && Date.now() < battle.busyUntil) {
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `${voicePrefix}いま${battle.opponent}がアンサーを考え中です。少し待ってから送ってください。`,
+    });
+  }
+
+  const userVerseNo = battle.verses.length + 1;
+  const updated = {
+    ...battle,
+    verses: [...battle.verses, { by: 'user', text, voice: isVoiceInput }],
+    lastActiveAt: Date.now(),
+  };
+  await logActivity({ type: 'battle_verse', userId, opponent: battle.opponent, verseNo: userVerseNo, voice: isVoiceInput });
+
+  // 生成中に二重送信されても処理が重ならないように印をつけておく
+  await saveBattle(userId, { ...battle, busyUntil: Date.now() + BATTLE_BUSY_MS });
+  await showLoading(userId, 40);
+
+  // 人の最後のバースが届いたら、バトル終了 → 講評
+  if (updated.verses.length >= BATTLE_TOTAL_VERSES) {
+    let review = null;
+    try {
+      review = await generateReview(updated);
+    } catch (err) {
+      console.error('講評の生成エラー:', err.message);
+      await logActivity({ type: 'battle_failed', userId, stage: 'review', error: err.message });
+    }
+    const finished = { ...updated, review, busyUntil: null };
+    await appendBattleLog(userId, finished);
+    await clearBattle(userId);
+    await logActivity({ type: 'battle_complete', userId, opponent: battle.opponent });
+
+    const lines = [`${voicePrefix}🏁 ${battle.opponent} とのバトル終了！お疲れさまでした`];
+    if (review) {
+      lines.push('', '【講評】');
+      if (review.good) lines.push(`👍 ${review.good}`);
+      if (review.answer) lines.push(`↩️ ${review.answer}`);
+      if (review.next) lines.push(`🎯 次は: ${review.next}`);
+    }
+    lines.push('', '次の相手を撮ってみよう📸');
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: lines.join('\n'),
+      quickReply: BATTLE_CAMERA_QUICK_REPLY,
+    });
+  }
+
+  // まだ途中なら、AIがアンサーの8小節を返す
+  let next;
+  try {
+    next = await generateNextVerse(updated);
+  } catch (err) {
+    console.error('アンサー生成エラー:', err.message);
+    await logActivity({ type: 'battle_failed', userId, stage: 'answer', error: err.message });
+    await saveBattle(userId, { ...battle, busyUntil: null }); // ユーザーのバースは未反映のまま、送り直してもらう
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `${voicePrefix}${battle.opponent}がアンサーを返せませんでした。同じバースをもう一度送ってください。`,
+    });
+  }
+
+  const aiVerseNo = updated.verses.length + 1;
+  const afterAi = {
+    ...updated,
+    verses: [...updated.verses, { by: 'ai', text: next.verse.join('\n'), rhymeNote: next.rhymeNote }],
+    lastActiveAt: Date.now(),
+    busyUntil: null,
+  };
+  await saveBattle(userId, afterAi);
+
+  const replyText = formatAiVerseMessage(afterAi, next.verse, next.rhymeNote, aiVerseNo);
+  return client.replyMessage(event.replyToken, { type: 'text', text: voicePrefix + replyText });
 }
 
 // --- お題(テーマ単語)のローテーション ---
@@ -720,6 +935,15 @@ async function handleEvent(event) {
     return null;
   }
 
+  // 写真が届いたら写真ラップバトルを開始する(複数枚まとめて送られた場合は1枚目だけを使う)
+  if (event.type === 'message' && event.message && event.message.type === 'image') {
+    const imageSet = event.message.imageSet;
+    if (imageSet && imageSet.index && imageSet.index > 1) {
+      return null;
+    }
+    return handleBattleImage(event);
+  }
+
   if (event.type === 'message' && event.message && (event.message.type === 'text' || event.message.type === 'audio')) {
     const userId = event.source.userId;
     const isVoiceInput = event.message.type === 'audio';
@@ -757,9 +981,10 @@ async function handleEvent(event) {
       }
       clearThemeTimer(userId); // 前のラウンドのタイマーが残っていれば念のためキャンセルする
       // 放置されたままの韻テストが残っていると、次に送る単語がそちらの判定に横取りされてしまうため、
-      // 新しいお題を受け取るタイミングで韻テストも片付けておく
+      // 新しいお題を受け取るタイミングで韻テストも片付けておく(ラップバトルも同様)
       clearTestTimer(userId);
       await clearTestSession(userId);
+      await clearBattle(userId);
       await saveSession(userId, newSessionWithTheme(theme));
       await logActivity({ type: 'theme_sent', userId, theme: theme.word, source: 'manual' });
       return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
@@ -768,6 +993,28 @@ async function handleEvent(event) {
     if (text === RHYME_LIST_TRIGGER_TEXT) {
       const groups = await buildRhymeGroups(userId);
       return client.replyMessage(event.replyToken, buildRhymeListFlexMessage(groups));
+    }
+
+    // リッチメニュー「ラップバトル」: カメラ起動ボタンを出す(実際のバトルは写真が届いた時点で始まる)
+    if (text === BATTLE_TRIGGER_TEXT) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text:
+          '📸 写真ラップバトル\n\n' +
+          '身の回りのものを撮ってください。写真の主役になりきったAIが、先攻で8小節を仕掛けてきます。\n' +
+          '(AI→あなた→AI→あなた の8小節×4本。返しはテキストでもボイスでもOK)',
+        quickReply: BATTLE_CAMERA_QUICK_REPLY,
+      });
+    }
+
+    // 写真ラップバトルが進行中なら、送られてきたものは「バース」として扱う
+    const battle = await loadBattle(userId);
+    if (battle) {
+      if (battle.lastActiveAt && Date.now() - battle.lastActiveAt > BATTLE_EXPIRE_MS) {
+        await clearBattle(userId); // 放置されたバトルは片付けて、通常の処理に進む
+      } else {
+        return handleBattleVerse(event, battle, text, voicePrefix, isVoiceInput);
+      }
     }
 
     // 韻テスト(奇数日17時に配信)が進行中なら、そちらを優先して判定する。
@@ -824,7 +1071,7 @@ async function handleEvent(event) {
     if (!session || !session.theme) {
       return client.replyMessage(event.replyToken, {
         type: 'text',
-        text: 'まずはリッチメニューの「お題を受け取る」から始めてください！',
+        text: 'まずはリッチメニューの「お題を受け取る」から始めてください！\n写真を送ると、写っているものとラップバトルもできます📸',
       });
     }
 
@@ -914,7 +1161,12 @@ app.get('/setup-richmenu', async (req, res) => {
   try {
     const existing = await client.getRichMenuList();
     for (const menu of existing) {
-      if (menu.name === RICHMENU_NAME || menu.name === 'rhyme-theme-menu' || menu.name === 'daily-word-menu') {
+      if (
+        menu.name === RICHMENU_NAME ||
+        menu.name === 'rhyme-theme-menu-v2' ||
+        menu.name === 'rhyme-theme-menu' ||
+        menu.name === 'daily-word-menu'
+      ) {
         await client.deleteRichMenu(menu.richMenuId);
         console.log(`古いリッチメニューを削除: ${menu.richMenuId}`);
       }
@@ -927,12 +1179,16 @@ app.get('/setup-richmenu', async (req, res) => {
       chatBarText: 'メニュー',
       areas: [
         {
-          bounds: { x: 0, y: 0, width: 1250, height: 843 },
+          bounds: { x: 0, y: 0, width: 833, height: 843 },
           action: { type: 'message', label: 'お題を受け取る', text: THEME_TRIGGER_TEXT },
         },
         {
-          bounds: { x: 1250, y: 0, width: 1250, height: 843 },
+          bounds: { x: 833, y: 0, width: 834, height: 843 },
           action: { type: 'message', label: '韻リストを見る', text: RHYME_LIST_TRIGGER_TEXT },
+        },
+        {
+          bounds: { x: 1667, y: 0, width: 833, height: 843 },
+          action: { type: 'message', label: 'ラップバトル', text: BATTLE_TRIGGER_TEXT },
         },
       ],
     });
@@ -1067,6 +1323,72 @@ app.get('/results', async (req, res) => {
 <body>
   <h1>韻トレ結果一覧(${log.length}件)</h1>
   ${log.length === 0 ? '<div class="empty">まだ結果がありません</div>' : cards}
+</body>
+</html>`);
+});
+
+// 写真ラップバトルの記録を一覧で見られるページ(研究データの確認用)
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+app.get('/battles', async (req, res) => {
+  if (!USERS_API_SECRET || req.query.token !== USERS_API_SECRET) {
+    return res.status(403).send('forbidden');
+  }
+  const log = await loadData(BATTLE_LOG_KEY, []);
+  const cards = [...log]
+    .reverse()
+    .map((b) => {
+      const date = new Date(b.completedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+      const verses = (b.verses || [])
+        .map((v, i) => {
+          const who = v.by === 'ai' ? `🤖 ${escapeHtml(b.opponent)}` : `🧑 ${escapeHtml(b.displayName)}${v.voice ? '(音声)' : ''}`;
+          return `<div class="verse ${v.by}"><div class="who">${i + 1}本目 ${who}</div><pre>${escapeHtml(v.text)}</pre></div>`;
+        })
+        .join('');
+      const review = b.review
+        ? `<div class="review">👍 ${escapeHtml(b.review.good)}<br>↩️ ${escapeHtml(b.review.answer)}<br>🎯 ${escapeHtml(b.review.next)}</div>`
+        : '';
+      return `
+        <div class="card">
+          <div class="meta">${date} ・ ${escapeHtml(b.displayName)}</div>
+          <div class="theme">相手: ${escapeHtml(b.opponent)}</div>
+          <div class="reason">${escapeHtml(b.reason)}</div>
+          ${verses}${review}
+        </div>`;
+    })
+    .join('');
+
+  res.send(`<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ラップバトル記録</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background:#f2f2f5; margin:0; padding:16px; color:#222; }
+  h1 { font-size:20px; margin-bottom:16px; }
+  .card { background:#fff; border-radius:12px; padding:14px 16px; margin-bottom:12px; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  .meta { font-size:12px; color:#888; margin-bottom:4px; }
+  .theme { font-weight:bold; }
+  .reason { font-size:12px; color:#666; margin-bottom:8px; }
+  .verse { border-left:3px solid #ccc; padding:4px 10px; margin:8px 0; }
+  .verse.ai { border-color:#7B61FF; }
+  .verse.user { border-color:#FFB800; }
+  .who { font-size:12px; color:#555; }
+  pre { white-space:pre-wrap; font-family:inherit; margin:4px 0 0; line-height:1.6; }
+  .review { background:#f7f7fb; border-radius:8px; padding:8px 10px; font-size:13px; line-height:1.6; }
+  .empty { color:#888; text-align:center; margin-top:40px; }
+</style>
+</head>
+<body>
+  <h1>ラップバトル記録(${log.length}件)</h1>
+  ${log.length === 0 ? '<div class="empty">まだ記録がありません</div>' : cards}
 </body>
 </html>`);
 });
