@@ -11,6 +11,7 @@
 //      ○が4つ貯まったら結果リストを表示してそのラウンドは終了
 //   5. リッチメニューの「韻リストを見る」で、母音ごとにまとめた自分の韻リストをFlex Messageで確認できる
 //      (お題として出た単語は太字、重複は1つにまとめる)
+//   ※ 2026/10/5: 「韻リストを見る」ボタンと、奇数日17時の韻テスト自動配信は停止(下の5・6は旧仕様)。
 //   6. 奇数日の17時に「韻テスト」を配信。自分の韻リストの中から母音グループを1つランダムに選び、
 //      そのお題を表示。お題以外の単語をすべて思い出して送るまで終わらない(○/×判定)。
 //   7. お題ゲーム・韻テストともに、最初の回答から30秒経過すると自動的に締め切る。
@@ -77,7 +78,7 @@ if (!hasUpstash) {
 }
 
 const RICHMENU_IMAGE_PATH = path.join(__dirname, 'richmenu.png');
-const RICHMENU_NAME = 'rhyme-theme-menu-v3';
+const RICHMENU_NAME = 'rhyme-theme-menu-v4';
 // リッチメニューのボタンをタップすると、このテキストがメッセージとして送られてくる
 const THEME_TRIGGER_TEXT = '今日のお題を受け取る';
 const RHYME_LIST_TRIGGER_TEXT = '韻リストを見る';
@@ -880,20 +881,8 @@ cron.schedule(
   { timezone: 'Asia/Tokyo' }
 );
 
-// 奇数日の17時だけ、韻テストを配信する
-cron.schedule(
-  '0 17 * * *',
-  () => {
-    const day = getJstDayOfMonth();
-    if (day % 2 === 1) {
-      console.log(`奇数日(${day}日)の17時、韻テストを配信します`);
-      sendRhymeTestToAll();
-    } else {
-      console.log(`偶数日(${day}日)の17時なので韻テストの配信はスキップします`);
-    }
-  },
-  { timezone: 'Asia/Tokyo' }
-);
+// (2026/10/5 停止) 奇数日17時の韻テスト自動配信は廃止。
+// 手動で送りたい場合は POST /send-rhyme-test?token=... を使う。
 
 // --- LINE Webhook ---
 app.post('/webhook', middleware(config), async (req, res) => {
@@ -988,11 +977,6 @@ async function handleEvent(event) {
       await saveSession(userId, newSessionWithTheme(theme));
       await logActivity({ type: 'theme_sent', userId, theme: theme.word, source: 'manual' });
       return client.replyMessage(event.replyToken, { type: 'text', text: formatThemeMessage(theme) });
-    }
-
-    if (text === RHYME_LIST_TRIGGER_TEXT) {
-      const groups = await buildRhymeGroups(userId);
-      return client.replyMessage(event.replyToken, buildRhymeListFlexMessage(groups));
     }
 
     // リッチメニュー「ラップバトル」: カメラ起動ボタンを出す(実際のバトルは写真が届いた時点で始まる)
@@ -1163,6 +1147,7 @@ app.get('/setup-richmenu', async (req, res) => {
     for (const menu of existing) {
       if (
         menu.name === RICHMENU_NAME ||
+        menu.name === 'rhyme-theme-menu-v3' ||
         menu.name === 'rhyme-theme-menu-v2' ||
         menu.name === 'rhyme-theme-menu' ||
         menu.name === 'daily-word-menu'
@@ -1179,15 +1164,11 @@ app.get('/setup-richmenu', async (req, res) => {
       chatBarText: 'メニュー',
       areas: [
         {
-          bounds: { x: 0, y: 0, width: 833, height: 843 },
+          bounds: { x: 0, y: 0, width: 1250, height: 843 },
           action: { type: 'message', label: 'お題を受け取る', text: THEME_TRIGGER_TEXT },
         },
         {
-          bounds: { x: 833, y: 0, width: 834, height: 843 },
-          action: { type: 'message', label: '韻リストを見る', text: RHYME_LIST_TRIGGER_TEXT },
-        },
-        {
-          bounds: { x: 1667, y: 0, width: 833, height: 843 },
+          bounds: { x: 1250, y: 0, width: 1250, height: 843 },
           action: { type: 'message', label: 'ラップバトル', text: BATTLE_TRIGGER_TEXT },
         },
       ],
